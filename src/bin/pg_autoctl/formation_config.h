@@ -16,13 +16,16 @@
 typedef struct FormationConfig
 {
 	/* pg_auto_failover formation setup */
+	char monitor_pguri[MAXCONNINFO];
+
 	char formation[NAMEDATALEN];
 	char formationKind[NAMEDATALEN];
 	char dbname[NAMEDATALEN];
 	bool formationHasSecondary;
+	int numberSyncStandbys;
 
 	/* PostgreSQL setup */
 	PostgresSetup pgSetup;
 } FormationConfig;
 
-#endif //FORMATION_CONFIG_H
+#endif /*FORMATION_CONFIG_H */

@@ -36,13 +36,12 @@ typedef struct KeeperFSMTransition
 /* src/bin/pg_autoctl/fsm.c */
 extern KeeperFSMTransition KeeperFSM[];
 
-bool read_pidfile(const char *pidfile, pid_t *pid);
-
 bool fsm_init_primary(Keeper *keeper);
 bool fsm_prepare_replication(Keeper *keeper);
 bool fsm_disable_replication(Keeper *keeper);
 bool fsm_resume_as_primary(Keeper *keeper);
 bool fsm_rewind_or_init(Keeper *keeper);
+bool fsm_maintain_replication_slots(Keeper *keeper);
 
 bool fsm_init_standby(Keeper *keeper);
 bool fsm_promote_standby(Keeper *keeper);
@@ -53,12 +52,27 @@ bool fsm_stop_replication(Keeper *keeper);
 
 bool fsm_enable_sync_rep(Keeper *keeper);
 bool fsm_disable_sync_rep(Keeper *keeper);
+bool fsm_apply_settings(Keeper *keeper);
 
 bool fsm_start_postgres(Keeper *keeper);
 bool fsm_stop_postgres(Keeper *keeper);
+bool fsm_stop_postgres_for_primary_maintenance(Keeper *keeper);
+bool fsm_stop_postgres_and_setup_standby(Keeper *keeper);
+bool fsm_checkpoint_and_stop_postgres(Keeper *keeper);
 
 bool fsm_start_maintenance_on_standby(Keeper *keeper);
 bool fsm_restart_standby(Keeper *keeper);
+
+bool fsm_report_lsn(Keeper *keeper);
+bool fsm_fast_forward(Keeper *keeper);
+bool fsm_prepare_cascade(Keeper *keeper);
+bool fsm_follow_new_primary(Keeper *keeper);
+bool fsm_cleanup_and_resume_as_primary(Keeper *keeper);
+
+/*
+ * Extra helpers.
+ */
+bool prepare_replication(Keeper *keeper, NodeState otherNodeState);
 
 /*
  * Generic API to use the previous definitions.

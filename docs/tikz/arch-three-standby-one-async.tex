@@ -1,0 +1,80 @@
+% Fix for: https://tex.stackexchange.com/a/315027/43228
+\RequirePackage{luatex85}
+\documentclass[border=10pt,17pt]{standalone}
+
+\usepackage{cfr-lm}
+\usepackage{pgf}
+\usepackage{tikz}
+\usetikzlibrary{arrows,shapes,snakes}
+\usetikzlibrary{shapes.multipart}
+
+\begin{document}
+
+%% sans-serif fonts, large by default, and bold too
+\sffamily
+\sbweight
+\bfseries
+\large
+
+\begin{tikzpicture}[>=stealth',auto,rounded corners]
+
+  \input{common.tex}
+
+  %% \draw [help lines] (-10,0) grid (10,20);
+
+  \node (flegend) at (0,18) {\textbf{\textt{number\_sync\_standby = 1}}} ;
+
+  \node  (a)   at (0,15)   [primary]
+         {\textbf{\normalsize Node A}
+           \nodepart{second}
+           \textbf{\Large Primary}
+           \nodepart[text=stxt]{third}
+           \texttt{replication quorum = true} \\
+           \texttt{candidate priority = 50}
+         };
+
+  \node  (b)   at (-7,2)  [standby]
+         {\textbf{\normalsize Node B}
+           \nodepart{second}
+           \textbf{\Large Secondary}
+           \nodepart[align=left]{third}
+           \texttt{replication quorum = true} \\
+           \texttt{candidate priority = 50}
+         };
+
+  \node  (c)   at (0,8)   [standby,rectangle split part fill={sbox,sbox,async}]
+         {\textbf{\normalsize Node C}
+           \nodepart{second}
+           \textbf{\Large Secondary}
+           \nodepart[align=left]{third}
+		   \textbf{\texttt{replication quorum = false}} \\
+		   \textbf{\texttt{candidate priority = 0}}
+         };
+
+  \node  (d)   at (7,2)   [standby]
+         {\textbf{\normalsize Node D}
+           \nodepart{second}
+           \textbf{\Large Secondary}
+           \nodepart[align=left]{third}
+           \texttt{replication quorum = true} \\
+           \texttt{candidate priority = 50}
+         };
+
+  \node  (app) at (-8,18)  [app]        {\Large Application};
+  \node  (m)   at (8,18)   [monitor]    {\Large Monitor};
+
+  \path (app) edge [sql,out=0,in=180]  node[below,near start] {SQL} (a)
+              edge [sqlf,out=-90,in=135]  node[left,near start] {SQL (fallback)} (b.north west)
+              edge [sqlf,out=-90,in=180]  (d.west)
+
+        (m)   edge [hc,out=-90,in=0] (a)
+              edge [hc,out=-90,in=0] (b.east)
+              edge [hc,out=-90,in=45] (c.north east)
+              edge [hc,out=-90,in=45] node[right,near start] {Health checks} (d.north east)
+
+        (a.south west) edge [sr] (b)
+        (a) edge [sr] node[left,near start]  {Streaming} node[right,near start] {Replication} (c)
+        (a.south east) edge [sr] (d);
+\end{tikzpicture}
+
+\end{document}

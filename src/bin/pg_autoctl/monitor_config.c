@@ -25,10 +25,20 @@
 	make_strbuf_option_default("pg_autoctl", "role", NULL, true, NAMEDATALEN, \
 							   config->role, MONITOR_ROLE)
 
+/*
+ * --hostname used to be --nodename, and we need to support transition from the
+ * old to the new name. For that, we read the pg_autoctl.nodename config
+ * setting and change it on the fly to hostname instead.
+ *
+ * As a result HOSTNAME is marked not required and NODENAME is marked compat.
+ */
+#define OPTION_AUTOCTL_HOSTNAME(config) \
+	make_strbuf_option("pg_autoctl", "hostname", "hostname", \
+					   false, _POSIX_HOST_NAME_MAX, config->hostname)
+
 #define OPTION_AUTOCTL_NODENAME(config) \
-	make_strbuf_option("pg_autoctl", "nodename", "nodename", \
-					   true, _POSIX_HOST_NAME_MAX, \
-					   config->nodename)
+	make_strbuf_compat_option("pg_autoctl", "nodename", \
+							  _POSIX_HOST_NAME_MAX, config->hostname)
 
 #define OPTION_POSTGRESQL_PGDATA(config) \
 	make_strbuf_option("postgresql", "pgdata", "pgdata", true, MAXPGPATH, \
@@ -64,10 +74,35 @@
 	make_strbuf_option("postgresql", "auth_method", "auth", \
 					   false, MAXPGPATH, config->pgSetup.authMethod)
 
+#define OPTION_SSL_ACTIVE(config) \
+	make_int_option_default("ssl", "active", NULL, \
+							false, &(config->pgSetup.ssl.active), 0)
+
+#define OPTION_SSL_MODE(config) \
+	make_strbuf_option("ssl", "sslmode", "ssl-mode", \
+					   false, SSL_MODE_STRLEN, config->pgSetup.ssl.sslModeStr)
+
+#define OPTION_SSL_CA_FILE(config) \
+	make_strbuf_option("ssl", "ca_file", "ssl-ca-file", \
+					   false, MAXPGPATH, config->pgSetup.ssl.caFile)
+
+#define OPTION_SSL_CRL_FILE(config) \
+	make_strbuf_option("ssl", "crl_file", "ssl-crl-file", \
+					   false, MAXPGPATH, config->pgSetup.ssl.crlFile)
+
+#define OPTION_SSL_SERVER_CERT(config) \
+	make_strbuf_option("ssl", "cert_file", "server-cert", \
+					   false, MAXPGPATH, config->pgSetup.ssl.serverCert)
+
+#define OPTION_SSL_SERVER_KEY(config) \
+	make_strbuf_option("ssl", "key_file", "server-key", \
+					   false, MAXPGPATH, config->pgSetup.ssl.serverKey)
+
 
 #define SET_INI_OPTIONS_ARRAY(config) \
 	{ \
 		OPTION_AUTOCTL_ROLE(config), \
+		OPTION_AUTOCTL_HOSTNAME(config), \
 		OPTION_AUTOCTL_NODENAME(config), \
 		OPTION_POSTGRESQL_PGDATA(config), \
 		OPTION_POSTGRESQL_PG_CTL(config), \
@@ -77,6 +112,12 @@
 		OPTION_POSTGRESQL_PORT(config), \
 		OPTION_POSTGRESQL_LISTEN_ADDRESSES(config), \
 		OPTION_POSTGRESQL_AUTH_METHOD(config), \
+		OPTION_SSL_MODE(config), \
+		OPTION_SSL_ACTIVE(config), \
+		OPTION_SSL_CA_FILE(config), \
+		OPTION_SSL_CRL_FILE(config), \
+		OPTION_SSL_SERVER_CERT(config), \
+		OPTION_SSL_SERVER_KEY(config), \
 		INI_OPTION_LAST \
 	}
 
@@ -121,7 +162,7 @@ monitor_config_set_pathnames_from_pgdata(MonitorConfig *config)
 
 
 /*
- * monitor_config_init initialises a MonitorConfig with the default values.
+ * monitor_config_init initializes a MonitorConfig with the default values.
  */
 void
 monitor_config_init(MonitorConfig *config,
@@ -149,51 +190,36 @@ monitor_config_init(MonitorConfig *config,
 	 * Keep the whole set of values discovered in pg_setup_init from the
 	 * configuration file
 	 */
-	memcpy(&(config->pgSetup), &pgSetup, sizeof(PostgresSetup));
-
-	/* set our configuration and state file pathnames */
-	if (!SetConfigFilePath(&(config->pathnames), config->pgSetup.pgdata))
-	{
-		log_error("Failed to initialize monitor's config, see above");
-		exit(EXIT_CODE_BAD_CONFIG);
-	}
-
-	if (!SetStateFilePath(&(config->pathnames), config->pgSetup.pgdata))
-	{
-		log_error("Failed to initialize monitor's config, see above");
-		exit(EXIT_CODE_BAD_CONFIG);
-	}
+	config->pgSetup = pgSetup;
 
 	/* A part of the monitor's pgSetup is hard-coded. */
 	strlcpy(config->pgSetup.dbname, PG_AUTOCTL_MONITOR_DBNAME, NAMEDATALEN);
 	strlcpy(config->pgSetup.username, PG_AUTOCTL_MONITOR_USERNAME, NAMEDATALEN);
+
+	if (config->pgSetup.hbaLevel == HBA_EDIT_UNKNOWN)
+	{
+		strlcpy(config->pgSetup.hbaLevelStr, "app", NAMEDATALEN);
+		config->pgSetup.hbaLevel = HBA_EDIT_LAN;
+	}
 }
 
 
 /*
- * monitor_config_init initialises a MonitorConfig from a KeeperConfig
+ * monitor_config_init initializes a MonitorConfig from a KeeperConfig
  * structure. That's useful for commands that may run on either a monitor or a
  * keeper node, such as `pg_autoctl monitor state|events|formation`, or
  * `pg_autoctl do destroy`.
  */
 bool
-monitor_config_init_from_pgsetup(Monitor *monitor,
-								 MonitorConfig *mconfig,
+monitor_config_init_from_pgsetup(MonitorConfig *mconfig,
 								 PostgresSetup *pgSetup,
 								 bool missingPgdataIsOk,
 								 bool pgIsNotRunningIsOk)
 {
+	PostgresSetup *MpgSetup = &(mconfig->pgSetup);
+
 	/* copy command line options over to the MonitorConfig structure */
-	strlcpy(mconfig->pgSetup.pgdata, pgSetup->pgdata, MAXPGPATH);
-	strlcpy(mconfig->pgSetup.pg_ctl, pgSetup->pg_ctl, MAXPGPATH);
-	strlcpy(mconfig->pgSetup.pg_version,
-			pgSetup->pg_version, PG_VERSION_STRING_MAX);
-	strlcpy(mconfig->pgSetup.pghost,
-			pgSetup->pghost, _POSIX_HOST_NAME_MAX);
-	strlcpy(mconfig->pgSetup.listen_addresses,
-			pgSetup->listen_addresses,
-			MAXPGPATH);
-	mconfig->pgSetup.pgport = pgSetup->pgport;
+	*MpgSetup = *pgSetup;
 
 	if (!monitor_config_set_pathnames_from_pgdata(mconfig))
 	{
@@ -212,7 +238,6 @@ monitor_config_init_from_pgsetup(Monitor *monitor,
 
 	return true;
 }
-
 
 
 /*
@@ -236,6 +261,26 @@ monitor_config_read_file(MonitorConfig *config,
 		return false;
 	}
 
+	/*
+	 * We have changed the --nodename option to being named --hostname, and
+	 * same in the configuration file: pg_autoctl.nodename is now
+	 * pg_autoctl.hostname.
+	 *
+	 * We can read either names from the configuration file and will then write
+	 * the current option name (pg_autoctl.hostname), but we can't have either
+	 * one be required anymore.
+	 *
+	 * Implement the "require" property here by making sure one of those names
+	 * have been used to populate the monitor config structure.
+	 */
+	if (IS_EMPTY_STRING_BUFFER(config->hostname))
+	{
+		log_error("Failed to read either pg_autoctl.hostname or its older "
+				  "name pg_autoctl.nodename from the \"%s\" configuration file",
+				  filename);
+		return false;
+	}
+
 	if (!pg_setup_init(&pgSetup,
 					   &config->pgSetup,
 					   missing_pgdata_is_ok,
@@ -248,11 +293,24 @@ monitor_config_read_file(MonitorConfig *config,
 	 * Keep the whole set of values discovered in pg_setup_init from the
 	 * configuration file
 	 */
-	memcpy(&(config->pgSetup), &pgSetup, sizeof(PostgresSetup));
+	config->pgSetup = pgSetup;
 
 	/* A part of the monitor's pgSetup is hard-coded. */
 	strlcpy(config->pgSetup.dbname, PG_AUTOCTL_MONITOR_DBNAME, NAMEDATALEN);
 	strlcpy(config->pgSetup.username, PG_AUTOCTL_MONITOR_USERNAME, NAMEDATALEN);
+
+	/*
+	 * Required for grandfathering old clusters that don't have sslmode
+	 * explicitely set
+	 */
+	if (IS_EMPTY_STRING_BUFFER(config->pgSetup.ssl.sslModeStr))
+	{
+		strlcpy(config->pgSetup.ssl.sslModeStr, "prefer", SSL_MODE_STRLEN);
+	}
+
+	/* set the ENUM value for sslMode */
+	config->pgSetup.ssl.sslMode =
+		pgsetup_parse_sslmode(config->pgSetup.ssl.sslModeStr);
 
 	return true;
 }
@@ -266,19 +324,17 @@ bool
 monitor_config_write_file(MonitorConfig *config)
 {
 	const char *filePath = config->pathnames.config;
-	bool success = false;
-	FILE *fileStream = NULL;
 
 	log_trace("monitor_config_write_file \"%s\"", filePath);
 
-	fileStream = fopen(filePath, "w");
+	FILE *fileStream = fopen_with_umask(filePath, "w", FOPEN_FLAGS_W, 0644);
 	if (fileStream == NULL)
 	{
-		log_error("Failed to open file \"%s\": %s", filePath, strerror(errno));
+		/* errors have already been logged */
 		return false;
 	}
 
-	success = monitor_config_write(fileStream, config);
+	bool success = monitor_config_write(fileStream, config);
 
 	if (fclose(fileStream) == EOF)
 	{
@@ -303,6 +359,21 @@ monitor_config_write(FILE *stream, MonitorConfig *config)
 
 
 /*
+ * monitor_config_to_json populates given jsRoot object with the INI
+ * configuration sections as JSON objects, and the options as keys to those
+ * objects.
+ */
+bool
+monitor_config_to_json(MonitorConfig *config, JSON_Value *js)
+{
+	JSON_Object *jsRoot = json_value_get_object(js);
+	IniOption monitorOptions[] = SET_INI_OPTIONS_ARRAY(config);
+
+	return ini_to_json(jsRoot, monitorOptions);
+}
+
+
+/*
  * monitor_config_log_settings outputs a DEBUG line per each config parameter
  * in the given MonitorConfig.
  */
@@ -317,6 +388,13 @@ monitor_config_log_settings(MonitorConfig config)
 	log_debug("postgresql.host: %s", config.pgSetup.pghost);
 	log_debug("postgresql.port: %d", config.pgSetup.pgport);
 	log_debug("postgresql.auth: %s", config.pgSetup.authMethod);
+
+	log_debug("ssl.active: %d", config.pgSetup.ssl.active);
+	log_debug("ssl.sslMode: %s", config.pgSetup.ssl.sslModeStr);
+	log_debug("ssl.caFile: %s", config.pgSetup.ssl.caFile);
+	log_debug("ssl.crlFile: %s", config.pgSetup.ssl.crlFile);
+	log_debug("ssl.serverKey: %s", config.pgSetup.ssl.serverCert);
+	log_debug("ssl.serverCert: %s", config.pgSetup.ssl.serverKey);
 }
 
 
@@ -354,7 +432,7 @@ monitor_config_merge_options(MonitorConfig *config, MonitorConfig *options)
 		 * Keep the whole set of values discovered in pg_setup_init from the
 		 * configuration file
 		 */
-		memcpy(&(config->pgSetup), &pgSetup, sizeof(PostgresSetup));
+		config->pgSetup = pgSetup;
 
 		return monitor_config_write_file(config);
 	}
@@ -369,18 +447,18 @@ monitor_config_merge_options(MonitorConfig *config, MonitorConfig *options)
  */
 bool
 monitor_config_get_postgres_uri(MonitorConfig *config, char *connectionString,
-		size_t size)
+								size_t size)
 {
 	char *connStringEnd = connectionString;
 	char host[BUFSIZE];
 
-	if (!IS_EMPTY_STRING_BUFFER(config->nodename))
+	if (!IS_EMPTY_STRING_BUFFER(config->hostname))
 	{
-		strlcpy(host, config->nodename, BUFSIZE);
+		strlcpy(host, config->hostname, BUFSIZE);
 	}
-	else if (IS_EMPTY_STRING_BUFFER(config->pgSetup.listen_addresses)
-			 || strcmp(config->pgSetup.listen_addresses,
-					   POSTGRES_DEFAULT_LISTEN_ADDRESSES) == 0)
+	else if (IS_EMPTY_STRING_BUFFER(config->pgSetup.listen_addresses) ||
+			 strcmp(config->pgSetup.listen_addresses,
+					POSTGRES_DEFAULT_LISTEN_ADDRESSES) == 0)
 	{
 		/*
 		 * We ouput the monitor connection string using the LAN ip of the
@@ -392,9 +470,12 @@ monitor_config_get_postgres_uri(MonitorConfig *config, char *connectionString,
 		 * PostgreSQL server to open it up to the local area network, e.g.
 		 * 129.168.1.0/23, so it should just work here.
 		 */
+		bool mayRetry = false;
+
 		if (!fetchLocalIPAddress(host, BUFSIZE,
 								 DEFAULT_INTERFACE_LOOKUP_SERVICE_NAME,
-								 DEFAULT_INTERFACE_LOOKUP_SERVICE_PORT))
+								 DEFAULT_INTERFACE_LOOKUP_SERVICE_PORT,
+								 LOG_WARN, &mayRetry))
 		{
 			/* error is already logged */
 			return false;
@@ -405,13 +486,50 @@ monitor_config_get_postgres_uri(MonitorConfig *config, char *connectionString,
 		strlcpy(host, config->pgSetup.listen_addresses, BUFSIZE);
 	}
 
-	connStringEnd += snprintf(connStringEnd,
-							  size - (connStringEnd - connectionString),
-							  "postgres://%s@%s:%d/%s",
-							  config->pgSetup.username,
-							  host,
-							  config->pgSetup.pgport,
-							  config->pgSetup.dbname);
+	/*
+	 * Finalize the connection string, with some variants depending on the
+	 * usage of SSL certificates. The full variant is with sslrootcert and
+	 * sslcrl connection parameters when using sslmode=verify-ca or
+	 * sslmode=verify-full.
+	 */
+	connStringEnd += sformat(connStringEnd,
+							 size - (connStringEnd - connectionString),
+							 "postgres://%s@%s:%d/%s",
+							 config->pgSetup.username,
+							 host,
+							 config->pgSetup.pgport,
+							 config->pgSetup.dbname);
+
+	if (config->pgSetup.ssl.sslMode >= SSL_MODE_PREFER)
+	{
+		char *sslmode = pgsetup_sslmode_to_string(config->pgSetup.ssl.sslMode);
+
+		connStringEnd += sformat(connStringEnd,
+								 size - (connStringEnd - connectionString),
+								 "?sslmode=%s",
+								 sslmode);
+
+		if (config->pgSetup.ssl.sslMode >= SSL_MODE_VERIFY_CA)
+		{
+			if (IS_EMPTY_STRING_BUFFER(config->pgSetup.ssl.crlFile))
+			{
+				connStringEnd +=
+					sformat(connStringEnd,
+							size - (connStringEnd - connectionString),
+							"&sslrootcert=%s",
+							config->pgSetup.ssl.caFile);
+			}
+			else
+			{
+				connStringEnd +=
+					sformat(connStringEnd,
+							size - (connStringEnd - connectionString),
+							"&sslrootcert=%s&sslcrl=%s",
+							config->pgSetup.ssl.caFile,
+							config->pgSetup.ssl.crlFile);
+			}
+		}
+	}
 
 	return true;
 }
@@ -445,7 +563,6 @@ monitor_config_set_setting(MonitorConfig *config,
 						   char *value)
 {
 	const char *filename = config->pathnames.config;
-	IniOption *option;
 	IniOption monitorOptions[] = SET_INI_OPTIONS_ARRAY(config);
 
 	if (ini_set_setting(filename, monitorOptions, path, value))
@@ -477,11 +594,10 @@ monitor_config_set_setting(MonitorConfig *config,
 bool
 monitor_config_update_with_absolute_pgdata(MonitorConfig *config)
 {
-	PostgresSetup pgSetup = config->pgSetup;
+	PostgresSetup *pgSetup = &(config->pgSetup);
 
-	if (pg_setup_set_absolute_pgdata(&pgSetup))
+	if (pg_setup_set_absolute_pgdata(pgSetup))
 	{
-		strlcpy(config->pgSetup.pgdata, pgSetup.pgdata, MAXPGPATH);
 		if (!monitor_config_write_file(config))
 		{
 			/* errors have already been logged */
@@ -490,4 +606,34 @@ monitor_config_update_with_absolute_pgdata(MonitorConfig *config)
 	}
 
 	return true;
+}
+
+
+/*
+ * monitor_config_accept_new returns true when we can accept to RELOAD our
+ * current config into the new one that's been editing.
+ */
+bool
+monitor_config_accept_new(MonitorConfig *config, MonitorConfig *newConfig)
+{
+	/* some elements are not supposed to change on a reload */
+	if (strneq(newConfig->pgSetup.pgdata, config->pgSetup.pgdata))
+	{
+		log_error("Attempt to change postgresql.pgdata from \"%s\" to \"%s\"",
+				  config->pgSetup.pgdata, newConfig->pgSetup.pgdata);
+		return false;
+	}
+
+	/* changing the hostname online is supported */
+	if (strneq(newConfig->hostname, config->hostname))
+	{
+		log_info("Reloading configuration: hostname is now \"%s\"; "
+				 "used to be \"%s\"",
+				 newConfig->hostname, config->hostname);
+		strlcpy(config->hostname, newConfig->hostname, _POSIX_HOST_NAME_MAX);
+	}
+
+	/* we can change any SSL related setup options at runtime */
+	return config_accept_new_ssloptions(&(config->pgSetup),
+										&(newConfig->pgSetup));
 }

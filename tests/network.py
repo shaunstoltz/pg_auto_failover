@@ -1,4 +1,5 @@
-from pyroute2 import netns, IPDB, IPRoute, netlink, NetNS, NSPopen
+from pyroute2 import netns, NDB, netlink, NSPopen
+from contextlib import contextmanager
 import ipaddress
 import subprocess
 import os
@@ -10,6 +11,25 @@ and explain why we use them here.
 """
 
 BRIDGE_NF_CALL_IPTABLES = "/proc/sys/net/bridge/bridge-nf-call-iptables"
+COMMAND_TIMEOUT = 60
+
+
+@contextmanager
+def managed_nspopen(*args, **kwds):
+    proc = NSPopen(*args, **kwds)
+    try:
+        yield proc
+    finally:
+        if proc.poll() is None:
+            # send SIGKILL to the process and wait for it to die if it's still
+            # running
+            proc.kill()
+            # If it's not dead after 2 seconds we throw an error
+            proc.communicate(timeout=2)
+
+        # release proxy process resourecs
+        proc.release()
+
 
 class VirtualLAN:
     """
@@ -21,6 +41,7 @@ class VirtualLAN:
     bridge.
     TODO: explain more details and add an example.
     """
+
     def __init__(self, namePrefix, subnet):
         ipnet = ipaddress.ip_network(subnet)
         self.availableHosts = ipnet.hosts()
@@ -28,7 +49,7 @@ class VirtualLAN:
         self.namePrefix = namePrefix
         self.nodes = []
         # create the bridge
-        self.bridgeName = ("%s-br" % (namePrefix, ))
+        self.bridgeName = "%s-br" % (namePrefix,)
         self.bridgeAddress = next(self.availableHosts)
         self._add_bridge(self.bridgeName, self.bridgeAddress, self.prefixLen)
         # Don't pass bridged IPv4 traffic to iptables' chains, so namespaces
@@ -75,13 +96,12 @@ class VirtualLAN:
         """
         _remove_interface_if_exists(name)
 
-        ipr = IPRoute()        
-        ipr.link('add', ifname=name, kind='bridge')
-
-        ipdb = IPDB()
-        with ipdb.interfaces[name] as bridge:
-            bridge.add_ip('%s/%d' % (address, prefixLen, ))
-            bridge.up()
+        with NDB() as ndb:
+            (
+                ndb.interfaces.create(ifname=name, kind="bridge", state="up")
+                .add_ip("%s/%s" % (address, prefixLen))
+                .commit()
+            )
 
     def _add_interface_to_bridge(self, bridge, interface):
         """
@@ -90,11 +110,10 @@ class VirtualLAN:
         network namespace, in which case after calling this function the namespace
         will be able to communicate with the other nodes in the virtual network.
         """
-        ipr = IPRoute()
-        bridge_idx = ipr.link_lookup(ifname=bridge)[0]
-        interface_idx = ipr.link_lookup(ifname=interface)[0]
-        ipr.link('set', index=interface_idx, master=bridge_idx)
-        ipr.link('set', index=interface_idx, state='up')
+        with NDB() as ndb:
+            ndb.interfaces[bridge].add_port(interface).commit()
+            ndb.interfaces[interface].set(state="up").commit()
+
 
 class VirtualNode:
     """
@@ -102,6 +121,7 @@ class VirtualNode:
 
     Internally, this corresponds to a Linux network namespace.
     """
+
     def __init__(self, namespace, address, prefixLen):
         self.namespace = namespace
         self.address = address
@@ -113,6 +133,7 @@ class VirtualNode:
         """
         Removes all objects created for the virtual node.
         """
+        _remove_interface_if_exists(self.vethPeer)
         try:
             netns.remove(self.namespace)
         except:
@@ -122,13 +143,73 @@ class VirtualNode:
     def run(self, command, user=os.getenv("USER")):
         """
         Executes a command under the given user from this virtual node. Returns
-        an NSOpen object to control the process. NSOpen has the same API as
-        subprocess.POpen.
+        a context manager that returns NSOpen object to control the process.
+        NSOpen has the same API as subprocess.POpen.
         """
-        sudo_command = ['sudo', '-E', '-u', user, 'env', 'PATH=' + os.getenv("PATH")] + command
-        return NSPopen(self.namespace, sudo_command, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       universal_newlines=True, start_new_session=True)
+        sudo_command = [
+            "sudo",
+            "-E",
+            "-u",
+            user,
+            "env",
+            "PATH=" + os.getenv("PATH"),
+        ] + command
+        return managed_nspopen(
+            self.namespace,
+            sudo_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            start_new_session=True,
+        )
+
+    def run_unmanaged(self, command, user=os.getenv("USER")):
+        """
+        Executes a command under the given user from this virtual node. Returns
+        an NSPopen object to control the process. NSOpen has the same API as
+        subprocess.Popen. This NSPopen object needs to be manually release. In
+        general you should prefer using run, where this is done automatically
+        by the context manager.
+        """
+        sudo_command = [
+            "sudo",
+            "-E",
+            "-u",
+            user,
+            "env",
+            "PATH=" + os.getenv("PATH"),
+        ] + command
+        return NSPopen(
+            self.namespace,
+            sudo_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            start_new_session=True,
+        )
+
+    def run_and_wait(self, command, name, timeout=COMMAND_TIMEOUT):
+        """
+        Waits for command to exit successfully. If it exits with error or it timeouts,
+        raises an execption with stdout and stderr streams of the process.
+        """
+        with self.run(command) as proc:
+            try:
+                out, err = proc.communicate(timeout=timeout)
+                if proc.returncode > 0:
+                    raise Exception(
+                        "%s failed, out: %s\n, err: %s" % (name, out, err)
+                    )
+                return out, err
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                raise Exception(
+                    "%s timed out after %d seconds. out: %s\n, err: %s"
+                    % (name, timeout, out, err)
+                )
 
     def _add_namespace(self, name, address, netmaskLength):
         """
@@ -145,21 +226,44 @@ class VirtualNode:
 
         _remove_interface_if_exists(self.vethPeer)
 
-        # Create the veth pair and set one endpoint to the namespace.
-        ipr = IPRoute()
-        ipr.link('add', ifname=veth_name, kind='veth', peer=self.vethPeer)
-        idx = ipr.link_lookup(ifname=veth_name)[0]
-        ipr.link('set', index=idx, net_ns_fd=name)
-
-        # Assign address to the veth interface and bring it up.
-        ipdb = IPDB(nl=NetNS(name))
-        with ipdb.interfaces[veth_name] as veth:
-            veth.add_ip('%s/%d' % (address, netmaskLength, ))
-            veth.up()
-
-        # Bring the loopback interface up.
-        with ipdb.interfaces['lo'] as lo:
-            lo.up()
+        with NDB() as ndb:
+            #
+            # Add netns to the NDB sources
+            #
+            # ndb.interfaces["lo"] is a short form of
+            # ndb.interfaces[{"target": "localhost", "ifname": "lo"}]
+            #
+            # To address interfaces/addresses/routes wthin a netns, use
+            # ndb.interfaces[{"target": netns_name, "ifname": "lo"}]
+            ndb.sources.add(netns=name)
+            #
+            # Create veth
+            (
+                ndb.interfaces.create(
+                    ifname=veth_name,
+                    kind="veth",
+                    peer=self.vethPeer,
+                    state="up",
+                )
+                .commit()
+                .set(net_ns_fd=name)
+                .commit()
+            )
+            #
+            # .interfaces.wait() returns an interface object when
+            # it becomes available on the specified source
+            (
+                ndb.interfaces.wait(target=name, ifname=veth_name)
+                .set(state="up")
+                .add_ip("%s/%s" % (address, netmaskLength))
+                .commit()
+            )
+            #
+            (
+                ndb.interfaces[{"target": name, "ifname": "lo"}]
+                .set(state="up")
+                .commit()
+            )
 
     def _remove_namespace_if_exists(self, name):
         """
@@ -168,9 +272,26 @@ class VirtualNode:
         """
         try:
             netns.remove(name)
-        except:
+        except Exception:
             # Namespace doesn't exist. Return silently.
             pass
+
+    def ifdown(self):
+        """
+        Bring the network interface down for this node
+        """
+        with NDB() as ndb:
+            # bring it down and wait until success
+            ndb.interfaces[self.vethPeer].set(state="down").commit()
+
+    def ifup(self):
+        """
+        Bring the network interface up for this node
+        """
+        with NDB() as ndb:
+            # bring it up and wait until success
+            ndb.interfaces[self.vethPeer].set(state="up").commit()
+
 
 def _remove_interface_if_exists(name):
     """
@@ -178,14 +299,9 @@ def _remove_interface_if_exists(name):
     just returns silently. A bridge is also an interface, so this can be
     used for removing bridges too.
     """
-    ipr = IPRoute()
-    # bring it down
-    try:
-        ipr.link('set', ifname=name, state='down')
-    except netlink.exceptions.NetlinkError:
-        pass
-    # remove it
-    try:
-        ipr.link('del', ifname=name)
-    except netlink.exceptions.NetlinkError:
-        pass
+    with NDB() as ndb:
+        if name in ndb.interfaces:
+            try:
+                ndb.interfaces[name].remove().commit()
+            except netlink.exceptions.NetlinkError:
+                pass

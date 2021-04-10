@@ -22,12 +22,19 @@ typedef enum
 
 IPType ip_address_type(const char *hostname);
 bool fetchLocalIPAddress(char *localIpAddress, int size,
-						 const char *serviceName, int servicePort);
+						 const char *serviceName, int servicePort,
+						 int logLevel, bool *mayRetry);
 bool fetchLocalCIDR(const char *localIpAddress, char *localCIDR, int size);
 bool findHostnameLocalAddress(const char *hostname,
 							  char *localIpAddress, int size);
 bool findHostnameFromLocalIpAddress(char *localIpAddress,
 									char *hostname, int size);
+
+bool resolveHostnameForwardAndReverse(const char *hostname,
+									  char *ipaddr, int size,
+									  bool *foundHostnameFromAddress);
+
+bool ipaddrGetLocalHostname(char *hostname, size_t size);
 
 
 #endif /* __IPADDRH__ */

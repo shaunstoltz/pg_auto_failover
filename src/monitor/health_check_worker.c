@@ -45,8 +45,16 @@
 #include "utils/memutils.h"
 #include "tcop/utility.h"
 
+/*
+ * The healthcheck only checks if it gets a response back from postgres. So
+ * both user and password are actually useless, because we do not need to
+ * authenticate. They are provided though to override any settings set through
+ * PGPASSWORD environment variable or .pgpass file. This way it does not matter
+ * that TLS is not necessarily used, because no secret information is sent.
+ */
 #define CONN_INFO_TEMPLATE \
-	"host=%s port=%u user=pgautofailover_monitor dbname=postgres " \
+	"host=%s port=%u user=pgautofailover_monitor " \
+	"password=pgautofailover_monitor dbname=postgres " \
 	"connect_timeout=%u"
 #define MAX_CONN_INFO_SIZE 1024
 
@@ -84,9 +92,9 @@ typedef struct HealthCheckHelperControlData
 	 * looking up (shared mode) or inserting (exclusive mode) per-database
 	 * data in HealthCheckWorkerDBHash.
 	 */
-	int				trancheId;
-	char		   *lockTrancheName;
-	LWLock			lock;
+	int trancheId;
+	char *lockTrancheName;
+	LWLock lock;
 } HealthCheckHelperControlData;
 
 /*
@@ -95,15 +103,15 @@ typedef struct HealthCheckHelperControlData
 typedef struct HealthCheckHelperDatabase
 {
 	/* hash key: database to run on */
-	Oid			dboid;
-	pid_t		workerPid;
+	Oid dboid;
+	pid_t workerPid;
 	bool isActive;
 } HealthCheckHelperDatabase;
 
 typedef struct DatabaseListEntry
 {
-	Oid		dboid;
-	char   *dbname;
+	Oid dboid;
+	char *dbname;
 } DatabaseListEntry;
 
 
@@ -116,12 +124,11 @@ static HealthCheckHelperControlData *HealthCheckHelperControl = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 
-
 /* private function declarations */
 static void pg_auto_failover_monitor_sigterm(SIGNAL_ARGS);
 static void pg_auto_failover_monitor_sighup(SIGNAL_ARGS);
 static BackgroundWorkerHandle * StartHealthCheckWorker(DatabaseListEntry *db);
-static List *BuildDatabaseList(void);
+static List * BuildDatabaseList(void);
 static bool pgAutoFailoverExtensionExists(void);
 static List * CreateHealthChecks(List *nodeHealthList);
 static HealthCheck * CreateHealthCheck(NodeHealth *nodeHealth);
@@ -136,13 +143,12 @@ static size_t HealthCheckWorkerShmemSize(void);
 static void HealthCheckWorkerShmemInit(void);
 
 
-
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 
 /* GUC variables */
-int HealthCheckPeriod = 20 * 1000;
+int HealthCheckPeriod = 5 * 1000;
 int HealthCheckTimeout = 5 * 1000;
 int HealthCheckMaxRetries = 2;
 int HealthCheckRetryDelay = 2 * 1000;
@@ -212,8 +218,6 @@ InitializeHealthCheckWorker(void)
 void
 HealthCheckWorkerLauncherMain(Datum arg)
 {
-	MemoryContext launcherContext = NULL;
-
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, pg_auto_failover_monitor_sighup);
 	pqsignal(SIGINT, SIG_IGN);
@@ -230,34 +234,32 @@ HealthCheckWorkerLauncherMain(Datum arg)
 	/* Make background worker recognisable in pg_stat_activity */
 	pgstat_report_appname("pg_auto_failover monitor launcher");
 
-	launcherContext = AllocSetContextCreateExtended(CurrentMemoryContext,
-													"Health Check Launcher Context",
-													ALLOCSET_DEFAULT_MINSIZE,
-													ALLOCSET_DEFAULT_INITSIZE,
-													ALLOCSET_DEFAULT_MAXSIZE);
+	MemoryContext launcherContext = AllocSetContextCreate(CurrentMemoryContext,
+														  "Health Check Launcher Context",
+														  ALLOCSET_DEFAULT_MINSIZE,
+														  ALLOCSET_DEFAULT_INITSIZE,
+														  ALLOCSET_DEFAULT_MAXSIZE);
 
 	MemoryContextSwitchTo(launcherContext);
 
 	while (!got_sigterm)
 	{
-		List	   *databaseList;
-		ListCell   *databaseListCell;
+		ListCell *databaseListCell;
 
-		databaseList = BuildDatabaseList();
+		List *databaseList = BuildDatabaseList();
 
 		foreach(databaseListCell, databaseList)
 		{
 			int pid;
-			BackgroundWorkerHandle *handle;
-			HealthCheckHelperDatabase *dbData;
 			DatabaseListEntry *entry =
 				(DatabaseListEntry *) lfirst(databaseListCell);
 			bool isFound = false;
 
 			LWLockAcquire(&HealthCheckHelperControl->lock, LW_EXCLUSIVE);
 
-			dbData = hash_search(HealthCheckWorkerDBHash,
-								 (void *) &entry->dboid, HASH_ENTER, &isFound);
+			HealthCheckHelperDatabase *dbData = hash_search(HealthCheckWorkerDBHash,
+															(void *) &entry->dboid,
+															HASH_ENTER, &isFound);
 			if (isFound && dbData->isActive)
 			{
 				/* This database has already been processed */
@@ -266,7 +268,7 @@ HealthCheckWorkerLauncherMain(Datum arg)
 			}
 
 			/* start a worker for the entry database, in the background */
-			handle = StartHealthCheckWorker(entry);
+			BackgroundWorkerHandle *handle = StartHealthCheckWorker(entry);
 			if (handle)
 			{
 				/*
@@ -326,16 +328,19 @@ StartHealthCheckWorker(DatabaseListEntry *db)
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	worker.bgw_main_arg = ObjectIdGetDatum(db->dboid);
 	worker.bgw_notify_pid = MyProcPid;
-	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pgautofailover");
-	snprintf(worker.bgw_function_name, BGW_MAXLEN, "HealthCheckWorkerMain");
-	snprintf(worker.bgw_name, BGW_MAXLEN,
-			 "pg_auto_failover monitor worker");
+	strlcpy(worker.bgw_library_name, "pgautofailover",
+			sizeof(worker.bgw_library_name));
+	strlcpy(worker.bgw_function_name, "HealthCheckWorkerMain",
+			sizeof(worker.bgw_function_name));
+	strlcpy(worker.bgw_name, "pg_auto_failover monitor worker",
+			sizeof(worker.bgw_name));
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 	{
 		ereport(LOG,
-				(errmsg("failed to start worker for pg_auto_failover health checks in \"%s\"",
-						db->dbname)));
+				(errmsg(
+					 "failed to start worker for pg_auto_failover health checks in \"%s\"",
+					 db->dbname)));
 		return NULL;
 	}
 
@@ -350,17 +355,15 @@ StartHealthCheckWorker(DatabaseListEntry *db)
 static List *
 BuildDatabaseList(void)
 {
-	List	   *databaseList = NIL;
-	Relation	pgDatabaseRelation;
-	HeapScanDesc scan;
-	HeapTuple	dbTuple;
+	List *databaseList = NIL;
+	HeapTuple dbTuple;
 	MemoryContext originalContext = CurrentMemoryContext;
 
 	StartTransactionCommand();
 
-	pgDatabaseRelation = heap_open(DatabaseRelationId, AccessShareLock);
+	Relation pgDatabaseRelation = heap_open(DatabaseRelationId, AccessShareLock);
 
-	scan = heap_beginscan_catalog(pgDatabaseRelation, 0, NULL);
+	TableScanDesc scan = table_beginscan_catalog(pgDatabaseRelation, 0, NULL);
 
 	while (HeapTupleIsValid(dbTuple = heap_getnext(scan, ForwardScanDirection)))
 	{
@@ -403,17 +406,15 @@ HealthCheckWorkerMain(Datum arg)
 {
 	Oid dboid = DatumGetObjectId(arg);
 	bool foundPgAutoFailoverExtension = false;
-	MemoryContext healthCheckContext = NULL;
-	HealthCheckHelperDatabase *myDbData;
 
 	/*
 	 * Look up this worker's configuration.
 	 */
 	LWLockAcquire(&HealthCheckHelperControl->lock, LW_SHARED);
 
-	myDbData = (HealthCheckHelperDatabase *)
-		hash_search(HealthCheckWorkerDBHash,
-					(void *) &dboid, HASH_FIND, NULL);
+	HealthCheckHelperDatabase *myDbData = (HealthCheckHelperDatabase *)
+										  hash_search(HealthCheckWorkerDBHash,
+													  (void *) &dboid, HASH_FIND, NULL);
 
 	if (!myDbData)
 	{
@@ -449,11 +450,11 @@ HealthCheckWorkerMain(Datum arg)
 	 * Only process given database when the extension has been loaded.
 	 * Otherwise, happily quit.
 	 */
-	healthCheckContext = AllocSetContextCreateExtended(CurrentMemoryContext,
-													   "Health check context",
-													   ALLOCSET_DEFAULT_MINSIZE,
-													   ALLOCSET_DEFAULT_INITSIZE,
-													   ALLOCSET_DEFAULT_MAXSIZE);
+	MemoryContext healthCheckContext = AllocSetContextCreate(CurrentMemoryContext,
+															 "Health check context",
+															 ALLOCSET_DEFAULT_MINSIZE,
+															 ALLOCSET_DEFAULT_INITSIZE,
+															 ALLOCSET_DEFAULT_MAXSIZE);
 
 	MemoryContextSwitchTo(healthCheckContext);
 
@@ -464,13 +465,9 @@ HealthCheckWorkerMain(Datum arg)
 	{
 		struct timeval currentTime = { 0, 0 };
 		struct timeval roundEndTime = { 0, 0 };
-		int timeout = 0;
-		List *nodeHealthList = NIL;
-		List *healthCheckList = NIL;
 
 		gettimeofday(&currentTime, NULL);
 		roundEndTime = AddTimeMillis(currentTime, HealthCheckPeriod);
-
 
 		if (!foundPgAutoFailoverExtension)
 		{
@@ -485,16 +482,20 @@ HealthCheckWorkerMain(Datum arg)
 
 		if (foundPgAutoFailoverExtension)
 		{
-			nodeHealthList = LoadNodeHealthList();
-			healthCheckList = CreateHealthChecks(nodeHealthList);
+			List *nodeHealthList = LoadNodeHealthList();
 
-			DoHealthChecks(healthCheckList);
+			if (nodeHealthList != NIL)
+			{
+				List *healthCheckList = CreateHealthChecks(nodeHealthList);
+
+				DoHealthChecks(healthCheckList);
+			}
 
 			MemoryContextReset(healthCheckContext);
 		}
 
 		gettimeofday(&currentTime, NULL);
-		timeout = SubtractTimes(roundEndTime, currentTime);
+		int timeout = SubtractTimes(roundEndTime, currentTime);
 
 		if (timeout >= 0)
 		{
@@ -523,12 +524,11 @@ HealthCheckWorkerMain(Datum arg)
 static bool
 pgAutoFailoverExtensionExists(void)
 {
-	Oid extensionOid;
 	MemoryContext originalContext = CurrentMemoryContext;
 
 	StartTransactionCommand();
 
-	extensionOid = get_extension_oid(AUTO_FAILOVER_EXTENSION_NAME, true);
+	Oid extensionOid = get_extension_oid(AUTO_FAILOVER_EXTENSION_NAME, true);
 
 	CommitTransactionCommand();
 
@@ -566,10 +566,9 @@ CreateHealthChecks(List *nodeHealthList)
 static HealthCheck *
 CreateHealthCheck(NodeHealth *nodeHealth)
 {
-	HealthCheck *healthCheck = NULL;
 	struct timeval invalidTime = { 0, 0 };
 
-	healthCheck = palloc0(sizeof(HealthCheck));
+	HealthCheck *healthCheck = palloc0(sizeof(HealthCheck));
 	healthCheck->node = nodeHealth;
 	healthCheck->state = HEALTH_CHECK_INITIAL;
 	healthCheck->connection = NULL;
@@ -625,14 +624,12 @@ WaitForEvent(List *healthCheckList)
 {
 	ListCell *healthCheckCell = NULL;
 	int healthCheckCount = list_length(healthCheckList);
-	struct pollfd *pollFDs = NULL;
 	struct timeval currentTime = { 0, 0 };
 	struct timeval nextEventTime = { 0, 0 };
 	int healthCheckIndex = 0;
-	int pollResult = 0;
-	int pollTimeout = 0;
 
-	pollFDs = (struct pollfd *) palloc0(healthCheckCount * sizeof(struct pollfd));
+	struct pollfd *pollFDs = (struct pollfd *) palloc0(healthCheckCount * sizeof(struct
+																				 pollfd));
 
 	gettimeofday(&currentTime, NULL);
 
@@ -679,7 +676,7 @@ WaitForEvent(List *healthCheckList)
 		healthCheckIndex++;
 	}
 
-	pollTimeout = SubtractTimes(nextEventTime, currentTime);
+	int pollTimeout = SubtractTimes(nextEventTime, currentTime);
 	if (pollTimeout < 0)
 	{
 		pollTimeout = 0;
@@ -689,7 +686,7 @@ WaitForEvent(List *healthCheckList)
 		pollTimeout = HealthCheckRetryDelay;
 	}
 
-	pollResult = poll(pollFDs, healthCheckCount, pollTimeout);
+	int pollResult = poll(pollFDs, healthCheckCount, pollTimeout);
 
 	if (pollResult < 0)
 	{
@@ -764,15 +761,10 @@ ManageHealthCheck(HealthCheck *healthCheck, struct timeval currentTime)
 		{
 			if (healthCheck->numTries >= HealthCheckMaxRetries + 1)
 			{
-				if (nodeHealth->healthState != NODE_HEALTH_BAD)
-				{
-					elog(LOG, "pg_auto_failover monitor marking node %s:%d as unhealthy",
-						 nodeHealth->nodeName,
-						 nodeHealth->nodePort);
-				}
-
-				SetNodeHealthState(healthCheck->node->nodeName,
+				SetNodeHealthState(healthCheck->node->nodeId,
+								   healthCheck->node->nodeHost,
 								   healthCheck->node->nodePort,
+								   nodeHealth->healthState,
 								   NODE_HEALTH_BAD);
 
 				healthCheck->state = HEALTH_CHECK_DEAD;
@@ -791,17 +783,16 @@ ManageHealthCheck(HealthCheck *healthCheck, struct timeval currentTime)
 		/* fallthrough */
 		case HEALTH_CHECK_INITIAL:
 		{
-			PGconn *connection = NULL;
-			ConnStatusType connStatus = CONNECTION_BAD;
-			char connInfoString[MAX_CONN_INFO_SIZE];
+			StringInfo connInfoString = makeStringInfo();
 
-			snprintf(connInfoString, MAX_CONN_INFO_SIZE, CONN_INFO_TEMPLATE,
-					 nodeHealth->nodeName, nodeHealth->nodePort, HealthCheckTimeout);
+			appendStringInfo(connInfoString, CONN_INFO_TEMPLATE,
+							 nodeHealth->nodeHost, nodeHealth->nodePort,
+							 HealthCheckTimeout);
 
-			connection = PQconnectStart(connInfoString);
+			PGconn *connection = PQconnectStart(connInfoString->data);
 			PQsetnonblocking(connection, true);
 
-			connStatus = PQstatus(connection);
+			ConnStatusType connStatus = PQstatus(connection);
 			if (connStatus == CONNECTION_BAD)
 			{
 				struct timeval nextTryTime = { 0, 0 };
@@ -829,6 +820,9 @@ ManageHealthCheck(HealthCheck *healthCheck, struct timeval currentTime)
 
 			healthCheck->numTries++;
 
+			pfree(connInfoString->data);
+			pfree(connInfoString);
+
 			break;
 		}
 
@@ -836,9 +830,6 @@ ManageHealthCheck(HealthCheck *healthCheck, struct timeval currentTime)
 		{
 			PGconn *connection = healthCheck->connection;
 			PostgresPollingStatusType pollingStatus = PGRES_POLLING_FAILED;
-			char *sqlstate = NULL;
-			bool receivedSqlstate = false;
-			bool cannotConnectNowSqlstate = false;
 
 			if (CompareTimes(&healthCheck->nextEventTime, &currentTime) < 0)
 			{
@@ -862,10 +853,10 @@ ManageHealthCheck(HealthCheck *healthCheck, struct timeval currentTime)
 
 			/* This logic is taken from libpq's internal_ping (fe-connect.c) */
 			pollingStatus = PQconnectPoll(connection);
-			sqlstate = connection->last_sqlstate;
-			receivedSqlstate = (sqlstate != NULL && strlen(sqlstate) == 5);
-			cannotConnectNowSqlstate = (receivedSqlstate &&
-										strcmp(sqlstate, CANNOT_CONNECT_NOW) == 0);
+			char *sqlstate = connection->last_sqlstate;
+			bool receivedSqlstate = (sqlstate != NULL && strlen(sqlstate) == 5);
+			bool cannotConnectNowSqlstate = (receivedSqlstate &&
+											 strcmp(sqlstate, CANNOT_CONNECT_NOW) == 0);
 
 			if (pollingStatus == PGRES_POLLING_OK ||
 
@@ -877,15 +868,10 @@ ManageHealthCheck(HealthCheck *healthCheck, struct timeval currentTime)
 			{
 				PQfinish(connection);
 
-				if (nodeHealth->healthState != NODE_HEALTH_GOOD)
-				{
-					elog(LOG, "pg_auto_failover monitor marking node %s:%d as healthy",
-						 nodeHealth->nodeName,
-						 nodeHealth->nodePort);
-				}
-
-				SetNodeHealthState(healthCheck->node->nodeName,
+				SetNodeHealthState(healthCheck->node->nodeId,
+								   healthCheck->node->nodeHost,
 								   healthCheck->node->nodePort,
+								   nodeHealth->healthState,
 								   NODE_HEALTH_GOOD);
 
 				healthCheck->connection = NULL;
@@ -1017,7 +1003,6 @@ static size_t
 HealthCheckWorkerShmemSize(void)
 {
 	Size size = 0;
-	Size hashSize = 0;
 
 	size = add_size(size, sizeof(HealthCheckHelperDatabase));
 
@@ -1026,8 +1011,8 @@ HealthCheckWorkerShmemSize(void)
 	 * worker process. We couldn't start more anyway, so there's little point
 	 * in allocating more.
 	 */
-	hashSize = hash_estimate_size(max_worker_processes,
-								  sizeof(HealthCheckHelperDatabase));
+	Size hashSize = hash_estimate_size(max_worker_processes,
+									   sizeof(HealthCheckHelperDatabase));
 	size = add_size(size, hashSize);
 
 	return size;
@@ -1043,7 +1028,6 @@ HealthCheckWorkerShmemInit(void)
 {
 	bool alreadyInitialized = false;
 	HASHCTL hashInfo;
-	int hashFlags = 0;
 
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
@@ -1073,7 +1057,7 @@ HealthCheckWorkerShmemInit(void)
 	hashInfo.keysize = sizeof(Oid);
 	hashInfo.entrysize = sizeof(HealthCheckHelperDatabase);
 	hashInfo.hash = tag_hash;
-	hashFlags = (HASH_ELEM | HASH_FUNCTION);
+	int hashFlags = (HASH_ELEM | HASH_FUNCTION);
 
 	HealthCheckWorkerDBHash = ShmemInitHash("pg_auto_failover Database Hash",
 											max_worker_processes,
@@ -1097,14 +1081,13 @@ void
 StopHealthCheckWorker(Oid databaseId)
 {
 	bool found = false;
-	HealthCheckHelperDatabase *dbData = NULL;
 	pid_t workerPid = 0;
 
 	LWLockAcquire(&HealthCheckHelperControl->lock, LW_EXCLUSIVE);
 
-	dbData = (HealthCheckHelperDatabase *)
-		hash_search(HealthCheckWorkerDBHash,
-					&databaseId, HASH_REMOVE, &found);
+	HealthCheckHelperDatabase *dbData = (HealthCheckHelperDatabase *)
+										hash_search(HealthCheckWorkerDBHash,
+													&databaseId, HASH_REMOVE, &found);
 
 	if (found)
 	{

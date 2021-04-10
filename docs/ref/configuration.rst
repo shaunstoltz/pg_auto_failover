@@ -26,7 +26,7 @@ operations:
     secondary at shutdown time, thus preventing data loss.::
 
       pgautofailover.primary_demote_timeout
-        
+
   - Preventing promotion of the secondary
 
     pg_auto_failover implements a trade-off where data availability trumps service
@@ -39,7 +39,7 @@ operations:
     safely, and the wal lag is 0 in that case.
 
     In the case when the secondary server had been detected unhealthy
-    before, then the pg_auto_failover monitor switches it from the sate SECONDARY to
+    before, then the pg_auto_failover monitor switches it from the state SECONDARY to
     the state CATCHING-UP and promotion is prevented then.
 
     The following setting allows to still promote the secondary, allowing
@@ -53,7 +53,8 @@ pg_auto_failover Monitor
 The configuration for the behavior of the monitor happens in the PostgreSQL
 database where the extension has been deployed::
 
-  pg_auto_failover=> select name, setting, unit, short_desc from pg_settings where name ~ 'pgautofailover.';                                                                                                                                                                                                                                                           -[ RECORD 1 ]----------------------------------------------------------------------------------------------------
+  pg_auto_failover=> select name, setting, unit, short_desc from pg_settings where name ~ 'pgautofailover.';
+  -[ RECORD 1 ]----------------------------------------------------------------------------------------------------
   name       | pgautofailover.enable_sync_wal_log_threshold
   setting    | 16777216
   unit       |
@@ -65,7 +66,7 @@ database where the extension has been deployed::
   short_desc | Maximum number of re-tries before marking a node as failed.
   -[ RECORD 3 ]----------------------------------------------------------------------------------------------------
   name       | pgautofailover.health_check_period
-  setting    | 20000
+  setting    | 5000
   unit       | ms
   short_desc | Duration between each check (in milliseconds).
   -[ RECORD 4 ]----------------------------------------------------------------------------------------------------
@@ -107,7 +108,7 @@ pg_auto_failover Keeper Service
 -------------------------------
 
 For an introduction to the ``pg_autoctl`` commands relevant to the pg_auto_failover
-Keeper configuration, please see :ref:`pg_autoctl_configuration`.
+Keeper configuration, please see :ref:`pg_autoctl_config`.
 
 An example configuration file looks like the following::
 
@@ -116,20 +117,21 @@ An example configuration file looks like the following::
   monitor = postgres://autoctl_node@192.168.1.34:6000/pg_auto_failover
   formation = default
   group = 0
-  nodename = node1.db.local.tld
+  hostname = node1.db
   nodekind = standalone
-  
+
   [postgresql]
   pgdata = /data/pgsql/
   pg_ctl = /usr/pgsql-10/bin/pg_ctl
   dbname = postgres
   host = /tmp
   port = 5000
-  
+
   [replication]
   slot = pgautofailover_standby
   maximum_backup_rate = 100M
-  
+  backup_directory = /data/backup/node1.db
+
   [timeout]
   network_partition_timeout = 20
   postgresql_restart_failure_timeout = 20
@@ -141,7 +143,7 @@ commands are provided::
   pg_autoctl config check [--pgdata <pgdata>]
   pg_autoctl config get [--pgdata <pgdata>] section.option
   pg_autoctl config set [--pgdata <pgdata>] section.option value
-  
+
 The ``[postgresql]`` section is discovered automatically by the ``pg_autoctl``
 command and is not intended to be changed manually.
 
@@ -160,7 +162,7 @@ formation name `default` is usually fine.
 This information is retrieved by the pg_auto_failover keeper when registering a node
 to the monitor, and should not be changed afterwards. Use at your own risk.
 
-**pg_autoctl.nodename**
+**pg_autoctl.hostname**
 
 Node `hostname` used by all the other nodes in the cluster to contact this
 node. In particular, if this node is a primary then its standby uses that
@@ -177,6 +179,18 @@ in PostgreSQL.
 When pg_auto_failover (re-)builds a standby node using the ``pg_basebackup``
 command, this parameter is given to ``pg_basebackup`` to throttle the
 network bandwidth used. Defaults to 100Mbps.
+
+**replication.backup_directory**
+
+When pg_auto_failover (re-)builds a standby node using the ``pg_basebackup``
+command, this parameter is the target directory where to copy the bits from
+the primary server. When the copy has been successful, then the directory is
+renamed to **postgresql.pgdata**.
+
+The default value is computed from ``${PGDATA}/../backup/${hostname}`` and
+can be set to any value of your preference. Remember that the directory
+renaming is an atomic operation only when both the source and the target of
+the copy are in the same filesystem, at least in Unix systems.
 
 **timeout**
 

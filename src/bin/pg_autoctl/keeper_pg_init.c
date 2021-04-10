@@ -7,24 +7,28 @@
  *
  */
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <unistd.h>
 
-#include "postgres_fe.h"
-
 #include "cli_common.h"
+#include "debian.h"
 #include "defaults.h"
+#include "env_utils.h"
 #include "fsm.h"
 #include "keeper.h"
 #include "keeper_config.h"
 #include "keeper_pg_init.h"
 #include "log.h"
 #include "monitor.h"
+#include "parsing.h"
 #include "pgctl.h"
 #include "pghba.h"
 #include "pgsetup.h"
 #include "pgsql.h"
+#include "service_keeper_init.h"
 #include "state.h"
+
 
 /*
  * We keep track of the fact that we had non-fatal warnings during `pg_autoctl
@@ -39,24 +43,38 @@
  */
 bool keeperInitWarnings = false;
 
-static KeeperStateInit initState = { 0 };
-
+static bool keeper_pg_init_and_register_primary(Keeper *keeper);
 static bool reach_initial_state(Keeper *keeper);
-
-static bool keeper_init_maybe_initdb(Keeper *keeper,
-									 bool *shouldCreateInstance);
-
-static bool create_database_and_extension(Keeper *keeper);
-
 static bool wait_until_primary_is_ready(Keeper *config,
 										MonitorAssignedState *assignedState);
-
+static bool wait_until_primary_has_created_our_replication_slot(Keeper *keeper,
+																MonitorAssignedState *
+																assignedState);
 static bool keeper_pg_init_node_active(Keeper *keeper);
 
 /*
- * keeper_pg_init initialises a pg_autoctl keeper and its local PostgreSQL
- * instance. Registering a PostgreSQL instance to the monitor is a 3 states
- * story:
+ * keeper_pg_init initializes a pg_autoctl keeper and its local PostgreSQL.
+ *
+ * Depending on whether we have a monitor or not in the config (see
+ * --without-monitor), then we call into keeper_pg_init_and_register or
+ * keeper_pg_init_fsm.
+ */
+bool
+keeper_pg_init(Keeper *keeper)
+{
+	KeeperConfig *config = &(keeper->config);
+
+	log_trace("keeper_pg_init: monitor is %s",
+			  config->monitorDisabled ? "disabled" : "enabled");
+
+	return service_keeper_init(keeper);
+}
+
+
+/*
+ * keeper_pg_init_and_register initializes a pg_autoctl keeper and its local
+ * PostgreSQL instance. Registering a PostgreSQL instance to the monitor is a 3
+ * states story:
  *
  * - register as INIT, the monitor decides your role (primary or secondary),
  *   and the keeper only does that when the local PostgreSQL instance does not
@@ -75,15 +93,29 @@ static bool keeper_pg_init_node_active(Keeper *keeper);
  * done, PostgreSQL is known to be running in the proper state.
  */
 bool
-keeper_pg_init(Keeper *keeper, KeeperConfig *config)
+keeper_pg_init_and_register(Keeper *keeper)
 {
+	KeeperConfig *config = &(keeper->config);
+
 	/*
 	 * The initial state we may register in depend on the current PostgreSQL
 	 * instance that might exist or not at PGDATA.
 	 */
-	PostgresSetup pgSetup = config->pgSetup;
-	bool postgresInstanceExists = pg_setup_pgdata_exists(&pgSetup);
-	bool postgresInstanceIsPrimary = pg_setup_is_primary(&pgSetup);
+	PostgresSetup *pgSetup = &(config->pgSetup);
+	bool postgresInstanceExists = pg_setup_pgdata_exists(pgSetup);
+	bool postgresInstanceIsRunning = pg_setup_is_running(pgSetup);
+	PostgresRole postgresRole = pg_setup_role(pgSetup);
+	bool postgresInstanceIsPrimary = postgresRole == POSTGRES_ROLE_PRIMARY;
+
+	if (postgresInstanceExists)
+	{
+		if (!keeper_ensure_pg_configuration_files_in_pgdata(config))
+		{
+			log_fatal("Failed to setup your Postgres instance "
+					  "the PostgreSQL way, see above for details");
+			return false;
+		}
+	}
 
 	/*
 	 * If we don't have a state file, we consider that we're initializing from
@@ -91,121 +123,130 @@ keeper_pg_init(Keeper *keeper, KeeperConfig *config)
 	 */
 	if (file_exists(config->pathnames.init))
 	{
-		return keeper_pg_init_continue(keeper, config);
+		return keeper_pg_init_continue(keeper);
 	}
 
 	if (file_exists(config->pathnames.state))
 	{
-		log_fatal("The state file \"%s\" exists and there's no init in progress",
-				  config->pathnames.state);
-		log_info("HINT: use `pg_autoctl run` to start the service.");
-		return false;
-	}
-
-	if (postgresInstanceExists
-		&& postgresInstanceIsPrimary
-		&& !allowRemovingPgdata)
-	{
-		char absolutePgdata[PATH_MAX];
-
-		log_warn("A postgres directory already exists at \"%s\", registering "
-				 "as a single node",
-				 realpath(pgSetup.pgdata, absolutePgdata));
-
-		/*
-		 * The local Postgres instance exists and we are not allowed to remove
-		 * it.
-		 *
-		 * If we're able to register as a single postgres server, that's great.
-		 *
-		 * If there already is a single postgres server, then we become the
-		 * wait_standby and we would have to remove our own database directory,
-		 * which the user didn't give us permission for. In that case, we
-		 * revert the situation by removing ourselves from the monitor and
-		 * removing the state file.
-		 */
-		if (!keeper_register_and_init(keeper, config, INIT_STATE))
+		if (createAndRun)
 		{
-			/* monitor_register_node logs relevant errors */
-			return false;
-		}
-
-		if (keeper->state.assigned_role != SINGLE_STATE)
-		{
-			log_error("There is already another postgres node, so the monitor "
-					  "wants us to be in state %s. However, that would involve "
-					  "removing the database directory.",
-					  NodeStateToString(keeper->state.assigned_role));
-
-			log_warn("Removing the node from the monitor");
-
-			if (!keeper_remove(keeper, config))
+			if (!keeper_init(keeper, config))
 			{
-				log_fatal("Failed to remove the node from the monitor, run "
-						  "`pg_autoctl drop node` to manually remove "
-						  "the node from the monitor");
 				return false;
 			}
-
-			log_warn("HINT: Re-run with --allow-removing-pgdata to allow "
-					 "pg_autoctl to remove \"%s\" and join as %s\n\n",
-					 absolutePgdata,
-					 NodeStateToString(keeper->state.assigned_role));
-
-			return false;
 		}
-
-		log_info("Successfully registered as \"%s\" to the monitor.",
-				 NodeStateToString(keeper->state.assigned_role));
-
-		return reach_initial_state(keeper);
-	}
-	else if (postgresInstanceExists && postgresInstanceIsPrimary)
-	{
-		/*
-		 * The local Postgres instance exists, but we are allowed to remove it
-		 * in case the monitor assigns the state wait_standby to us. Therefore,
-		 * we register in INIT_STATE and let the monitor decide.
-		 */
-
-		if (!keeper_register_and_init(keeper, config, INIT_STATE))
+		else
 		{
-			/* monitor_register_node logs relevant errors */
-			return false;
+			log_fatal("The state file \"%s\" exists and "
+					  "there's no init in progress", config->pathnames.state);
+			log_info("HINT: use `pg_autoctl run` to start the service.");
+			exit(EXIT_CODE_QUIT);
 		}
-
-		log_info("Successfully registered as \"%s\" to the monitor.",
-				 NodeStateToString(keeper->state.assigned_role));
-
-		return reach_initial_state(keeper);
+		return createAndRun;
 	}
-	else if (postgresInstanceExists && !postgresInstanceIsPrimary)
+
+	/*
+	 * When the monitor is disabled, we're almost done. All that is left is
+	 * creating a state file with our nodeId as from the --node-id parameter.
+	 * The value is found in the global variable monitorDisabledNodeId.
+	 */
+	if (config->monitorDisabled)
 	{
-		log_error("pg_autoctl doesn't know how to register an already "
-				  "existing standby server at the moment");
-		return false;
+		return keeper_init_fsm(keeper);
 	}
-	else if (!postgresInstanceExists)
+
+	/*
+	 * If the local Postgres instance does not exist, we have two possible
+	 * choices: either we're the only one in our group, or we are joining a
+	 * group that already exists.
+	 *
+	 * The situation is decided by the Monitor, which implements transaction
+	 * semantics and safe concurrency approach, needed here in case other
+	 * keeper are concurrently registering other nodes.
+	 *
+	 * So our strategy is to ask the monitor to pick a state for us and then
+	 * implement whatever was decided. After all PGDATA does not exists yet so
+	 * we can decide to either pg_ctl initdb or pg_basebackup to create it.
+	 */
+	if (!postgresInstanceExists)
 	{
-		/*
-		 * The local Postgres instance does not exist. We have two possible
-		 * choices here, either we're the only one in our group, or we are
-		 * joining a group that already exists.
-		 *
-		 * The situation is decided by the Monitor, which implements
-		 * transaction semantics and safe concurrency approach, needed here in
-		 * case other keeper are concurrently registering other nodes.
-		 *
-		 * So our strategy is to ask the monitor to pick a state for us and
-		 * then implement whatever was decided.
-		 */
-		if (!keeper_register_and_init(keeper, config, INIT_STATE))
+		if (!keeper_register_and_init(keeper, INIT_STATE))
 		{
 			log_error("Failed to register the existing local Postgres node "
 					  "\"%s:%d\" running at \"%s\""
 					  "to the pg_auto_failover monitor at %s, "
 					  "see above for details",
-					  config->nodename, config->pgSetup.pgport,
+					  config->hostname, config->pgSetup.pgport,
+					  config->pgSetup.pgdata, config->monitor_pguri);
+			return false;
+		}
+
+		log_info("Successfully registered as \"%s\" to the monitor.",
+				 NodeStateToString(keeper->state.assigned_role));
+
+		return reach_initial_state(keeper);
+	}
+
+	/*
+	 * Ok so there's already a Postgres instance that exists in $PGDATA.
+	 *
+	 * If it's running and is a primary, we can register it as it is and expect
+	 * a SINGLE state from the monitor.
+	 *
+	 * If it's running and is not a primary, we don't know how to handle the
+	 * situation yet: the already existing secondary is using its own
+	 * replication slot and primary conninfo string (with username, password,
+	 * SSL setup, etc).
+	 */
+	if (postgresInstanceIsRunning)
+	{
+		if (postgresInstanceIsPrimary)
+		{
+			log_info("Registering Postgres system %" PRIu64
+					 " running on port %d with pid %d found at \"%s\"",
+					 pgSetup->control.system_identifier,
+					 pgSetup->pidFile.port,
+					 pgSetup->pidFile.pid,
+					 pgSetup->pgdata);
+
+			return keeper_pg_init_and_register_primary(keeper);
+		}
+		else
+		{
+			log_error("pg_autoctl doesn't know how to register an already "
+					  "existing standby server at the moment");
+			return false;
+		}
+	}
+
+	/*
+	 * Ok so there's a Postgres instance that exists in $PGDATA and it's not
+	 * running at the moment. We have run pg_controldata on the instance and we
+	 * do have its system_identifier. Using it to register, we have two cases:
+	 *
+	 * - either we are the first node in our group and all is good, we can
+	 *   register the current PGDATA as a SINGLE, maybe promoting it to being a
+	 *   primary,
+	 *
+	 * - or a primary node already is registered in our group, and we are going
+	 *   to join it as a secondary: that is only possible when the
+	 *   system_identifier of the other nodes in the group are all the same,
+	 *   which the monitor checks for us in a way that registration fails when
+	 *   that's not the case.
+	 */
+	if (postgresInstanceExists && !postgresInstanceIsRunning)
+	{
+		log_info("Registering Postgres system %" PRIu64 " found at \"%s\"",
+				 pgSetup->control.system_identifier,
+				 pgSetup->pgdata);
+
+		if (!keeper_register_and_init(keeper, INIT_STATE))
+		{
+			log_error("Failed to register the existing local Postgres node "
+					  "\"%s:%d\" running at \"%s\""
+					  "to the pg_auto_failover monitor at %s, "
+					  "see above for details",
+					  config->hostname, config->pgSetup.pgport,
 					  config->pgSetup.pgdata, config->monitor_pguri);
 			return false;
 		}
@@ -225,6 +266,41 @@ keeper_pg_init(Keeper *keeper, KeeperConfig *config)
 	return false;
 }
 
+
+/*
+ * keeper_pg_init_and_register_primary registers a local Postgres instance that
+ * is known to be a primary: Postgres is running and SELECT pg_is_in_recovery()
+ * returns false.
+ */
+static bool
+keeper_pg_init_and_register_primary(Keeper *keeper)
+{
+	KeeperConfig *config = &(keeper->config);
+	PostgresSetup *pgSetup = &(config->pgSetup);
+	char absolutePgdata[PATH_MAX];
+
+	log_info("A postgres directory already exists at \"%s\", registering "
+			 "as a single node",
+			 realpath(pgSetup->pgdata, absolutePgdata));
+
+	/* register to the monitor in the expected state directly */
+	if (!keeper_register_and_init(keeper, SINGLE_STATE))
+	{
+		log_error("Failed to register the existing local Postgres node "
+				  "\"%s:%d\" running at \"%s\""
+				  "to the pg_auto_failover monitor at %s, "
+				  "see above for details",
+				  config->hostname, config->pgSetup.pgport,
+				  config->pgSetup.pgdata, config->monitor_pguri);
+	}
+
+	log_info("Successfully registered as \"%s\" to the monitor.",
+			 NodeStateToString(keeper->state.assigned_role));
+
+	return reach_initial_state(keeper);
+}
+
+
 /*
  * keeper_pg_init_continue attempts to continue a `pg_autoctl create` that
  * failed through in the middle. A particular case of interest is trying to
@@ -237,15 +313,21 @@ keeper_pg_init(Keeper *keeper, KeeperConfig *config)
  * registered to the monitor: that's when we create the init file.
  */
 bool
-keeper_pg_init_continue(Keeper *keeper, KeeperConfig *config)
+keeper_pg_init_continue(Keeper *keeper)
 {
+	KeeperStateData *keeperState = &(keeper->state);
+	KeeperStateInit *initState = &(keeper->initState);
+	KeeperConfig *config = &(keeper->config);
+
+	/* initialize our keeper state and read the state file */
 	if (!keeper_init(keeper, config))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	if (!keeper_init_state_read(keeper, &initState))
+	/* also read the init state file */
+	if (!keeper_init_state_read(initState, config->pathnames.init))
 	{
 		log_fatal("Failed to restart from previous keeper init attempt");
 		log_info("HINT: use `pg_autoctl drop node` to retry in a clean state");
@@ -254,7 +336,7 @@ keeper_pg_init_continue(Keeper *keeper, KeeperConfig *config)
 
 	log_info("Continuing from a previous `pg_autoctl create` failed attempt");
 	log_info("PostgreSQL state at registration time was: %s",
-			 PreInitPostgreInstanceStateToString(initState.pgInitState));
+			 PreInitPostgreInstanceStateToString(initState->pgInitState));
 
 	/*
 	 * TODO: verify the information in the state file against the information
@@ -262,17 +344,41 @@ keeper_pg_init_continue(Keeper *keeper, KeeperConfig *config)
 	 */
 
 	/*
+	 * Also update the groupId and replication slot name in the configuration
+	 * file, from the keeper state file: we might not have reached a point
+	 * where the configuration changes have been saved to disk in the previous
+	 * attempt.
+	 */
+	if (!keeper_config_update(&(keeper->config),
+							  keeperState->current_node_id,
+							  keeperState->current_group))
+	{
+		log_error("Failed to update the configuration file with the groupId %d "
+				  "and the nodeId %d",
+				  keeperState->current_group,
+				  keeperState->current_node_id);
+		return false;
+	}
+
+	/*
 	 * If we have an init file and the state file looks good, then the
 	 * operation that failed was removing the init state file.
 	 */
-	if (keeper->state.current_role == keeper->state.assigned_role
-		&& (keeper->state.current_role == SINGLE_STATE
-			|| keeper->state.current_role == CATCHINGUP_STATE))
+	if (keeper->state.current_role == keeper->state.assigned_role &&
+		(keeper->state.current_role == SINGLE_STATE ||
+		 keeper->state.current_role == CATCHINGUP_STATE))
 	{
 		return unlink_file(config->pathnames.init);
 	}
 
-	return reach_initial_state(keeper);
+	if (config->monitorDisabled)
+	{
+		return true;
+	}
+	else
+	{
+		return reach_initial_state(keeper);
+	}
 }
 
 
@@ -291,31 +397,11 @@ keeper_pg_init_continue(Keeper *keeper, KeeperConfig *config)
 static bool
 reach_initial_state(Keeper *keeper)
 {
-	KeeperConfig config = keeper->config;
-	bool pgInstanceIsOurs = false;
+	KeeperConfig *config = &(keeper->config);
 
 	log_trace("reach_initial_state: %s to %s",
 			  NodeStateToString(keeper->state.current_role),
 			  NodeStateToString(keeper->state.assigned_role));
-
-	/*
-	 * In somes cases we have some preparation steps to do: pg_ctl initdb. Now
-	 * is the right time to do them.
-	 */
-	if (!keeper_init_maybe_initdb(keeper, &pgInstanceIsOurs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/*
-	 * It might happen that PGDATA already exists at this point, but the
-	 * PostgreSQL instance is not running. In that case the transition from
-	 * INIT to SINGLE is going to first start PostgreSQL, and we should
-	 * consider that the instance is ours really.
-	 */
-	pgInstanceIsOurs =
-		pgInstanceIsOurs || !pg_setup_is_running(&config.pgSetup);
 
 	/*
 	 * To move from current_role to assigned_role, we call in the FSM.
@@ -335,7 +421,6 @@ reach_initial_state(Keeper *keeper)
 	 */
 	switch (keeper->state.assigned_role)
 	{
-
 		case CATCHINGUP_STATE:
 		{
 			/*
@@ -353,7 +438,7 @@ reach_initial_state(Keeper *keeper)
 			/*
 			 * Now the transition from INIT_STATE to WAIT_STANDBY_STATE consist
 			 * of doing nothing on the keeper's side: we are just waiting until
-			 * the primary has update its HBA setup with our nodename.
+			 * the primary has updated its HBA setup with our hostname.
 			 */
 			MonitorAssignedState assignedState = { 0 };
 
@@ -406,60 +491,12 @@ reach_initial_state(Keeper *keeper)
 
 		case SINGLE_STATE:
 		{
-			/*
-			 * What remains to be done is either opening the HBA for a test
-			 * setup, or when we are initializing pg_auto_failover on an
-			 * existing PostgreSQL primary server instance, making sure that
-			 * the parameters are all set.
-			 */
-			if (pgInstanceIsOurs)
-			{
-				if (getenv("PG_REGRESS_SOCK_DIR") != NULL)
-				{
-					/*
-					 * In test environements allow nodes from the same network
-					 * to connect. The network is discovered automatically.
-					 */
-					(void) pghba_enable_lan_cidr(&keeper->postgres.sqlClient,
-												 HBA_DATABASE_ALL, NULL,
-												 keeper->config.nodename,
-												 NULL, DEFAULT_AUTH_METHOD, NULL);
-
-				}
-			}
-			else
-			{
-				/*
-				 * As we are registering a previsouly existing PostgreSQL
-				 * instance, we now check that our mininum configuration
-				 * requirements for pg_auto_failover are in place. If not, tell
-				 * the user they must restart PostgreSQL at their next
-				 * maintenance window to fully enable pg_auto_failover.
-				 */
-				bool settings_are_ok = false;
-
-				if (!check_postgresql_settings(&(keeper->postgres),
-											   &settings_are_ok))
-				{
-					log_fatal("Failed to check local PostgreSQL settings "
-							  "compliance with pg_auto_failover, "
-							  "see above for details");
-					return false;
-				}
-				else if (!settings_are_ok)
-				{
-					log_fatal("Current PostgreSQL settings are not compliant "
-							  "with pg_auto_failover requirements, "
-							  "please restart PostgreSQL at the next "
-							  "opportunity to enable pg_auto_failover changes, "
-							  "and redo `pg_autoctl create`");
-					return false;
-				}
-			}
+			/* it's all done in the INIT ➜ SINGLE transition now. */
 			break;
 		}
 
 		default:
+
 			/* we don't support any other state at initialization time */
 			log_error("reach_initial_state: don't know how to read state %s",
 					  NodeStateToString(keeper->state.assigned_role));
@@ -477,118 +514,7 @@ reach_initial_state(Keeper *keeper)
 	}
 
 	/* everything went fine, get rid of the init state file */
-	return unlink_file(config.pathnames.init);
-}
-
-
-/*
- * keeper_init_maybe_initdb checks if the `pg_autoctl create` process needs to
- * `pg_ctl initdb` a local PostgreSQL cluster, and register this information in
- * the given boolean pointer pgInstanceIsOurs.
- *
- * It returns true when it's happy about what it did:
- *
- *  - Either initdb wasn't necessary and nothing was done
- *  - Or initdb was necessary and was successfully done.
- */
-static bool
-keeper_init_maybe_initdb(Keeper *keeper, bool *pgInstanceIsOurs)
-{
-	PostgresSetup pgSetup = keeper->config.pgSetup;
-	bool postgresInstanceExists = pg_setup_pgdata_exists(&pgSetup);
-
-	/*
-	 * When going from INIT to SINGLE, it is the responsibility of the
-	 * keeper_pg_init() function to `pg_ctl initdb` the local PostgreSQL
-	 * cluster before entering the FSM itself.
-	 *
-	 * In other cases, we don't have to initdb.
-	 */
-	if (!(keeper->state.current_role == INIT_STATE
-		  && keeper->state.assigned_role == SINGLE_STATE))
-	{
-		*pgInstanceIsOurs = false;
-		return true;
-	}
-
-	/*
-	 * We decide whether to initdb or not depending on the current state of the
-	 * PGDATA directory, and we decide whether we own the instance of not on
-	 * the state of PGDATA when we first did our `pg_autoctl create`
-	 * invocation, so as to be able to init several times until everything is
-	 * fixed.
-	 */
-	if (initState.pgInitState == PRE_INIT_STATE_EMTPY)
-	{
-		*pgInstanceIsOurs = true;
-	}
-
-	/*
-	 * We might have to `pg_ctl initdb`:
-	 */
-	if (!postgresInstanceExists)
-	{
-		if (!pg_ctl_initdb(pgSetup.pg_ctl, pgSetup.pgdata))
-		{
-			log_fatal("Failed to initialise a PostgreSQL instance at \"%s\""
-					  ", see above for details", pgSetup.pgdata);
-
-			return false;
-		}
-
-		/*
-		 * We managed to initdb, refresh our configuration file location with
-		 * the realpath(3) from pg_setup_update_config_with_absolute_pgdata:
-		 *  we might have been given a relative pathname.
-		 */
-		if (!keeper_config_update_with_absolute_pgdata(&(keeper->config)))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
-
-	/*
-	 * Now, if we just initialized the cluster, we may restart it and create
-	 * databases and everything. If PostgreSQL is not running, we can consider
-	 * that we are allowed to start and restart it too, there won't be a
-	 * negative impact on the service.
-	 *
-	 * If Postgres is already running though, again, chicken out.
-	 */
-	if (! *pgInstanceIsOurs)
-	{
-		bool postgresIsRunning =
-			initState.pgInitState >= PRE_INIT_STATE_RUNNING;
-
-		if (postgresIsRunning)
-		{
-			log_error("PostgreSQL is already running at \"%s\", refusing to "
-					  "initialize a new cluster on-top of the current one.",
-					  pgSetup.pgdata);
-
-			return false;
-		}
-		else
-		{
-			*pgInstanceIsOurs = true;
-		}
-	}
-
-	/*
-	 * Now that we've checked that PostgreSQL is ours, we can finish the
-	 * install.
-	 */
-	if (*pgInstanceIsOurs)
-	{
-		if (!create_database_and_extension(keeper))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
-
-	return true;
+	return unlink_file(config->pathnames.init);
 }
 
 
@@ -603,31 +529,49 @@ wait_until_primary_is_ready(Keeper *keeper,
 							MonitorAssignedState *assignedState)
 {
 	bool pgIsRunning = false;
-	int64_t replicationLag = 0L;
+	char currrentLSN[PG_LSN_MAXLENGTH] = "0/0";
 	char *pgsrSyncState = "";
 	int errors = 0, tries = 0;
 	bool firstLoop = true;
 
 	/* wait until the primary is ready for us to pg_basebackup */
 	do {
+		bool groupStateHasChanged = false;
+
 		if (firstLoop)
 		{
 			firstLoop = false;
 		}
 		else
 		{
-			sleep(PG_AUTOCTL_KEEPER_SLEEP_TIME);
+			Monitor *monitor = &(keeper->monitor);
+			KeeperStateData *keeperState = &(keeper->state);
+			int timeoutMs = PG_AUTOCTL_KEEPER_SLEEP_TIME * 1000;
+
+			(void) pgsql_prepare_to_wait(&(monitor->notificationClient));
+			(void) monitor_wait_for_state_change(monitor,
+												 keeper->config.formation,
+												 keeperState->current_group,
+												 keeperState->current_node_id,
+												 timeoutMs,
+												 &groupStateHasChanged);
+
+			/* when no state change has been notified, close the connection */
+			if (!groupStateHasChanged &&
+				monitor->notificationClient.connectionStatementType ==
+				PGSQL_CONNECTION_MULTI_STATEMENT)
+			{
+				pgsql_finish(&(monitor->notificationClient));
+			}
 		}
 
 		if (!monitor_node_active(&(keeper->monitor),
 								 keeper->config.formation,
-								 keeper->config.nodename,
-								 keeper->config.pgSetup.pgport,
 								 keeper->state.current_node_id,
 								 keeper->state.current_group,
 								 keeper->state.current_role,
 								 pgIsRunning,
-								 replicationLag,
+								 currrentLSN,
 								 pgsrSyncState,
 								 assignedState))
 		{
@@ -644,7 +588,12 @@ wait_until_primary_is_ready(Keeper *keeper,
 				return false;
 			}
 		}
-		++tries;
+
+		/* if state has changed, we didn't wait for a full timeout */
+		if (!groupStateHasChanged)
+		{
+			++tries;
+		}
 
 		if (tries == 3)
 		{
@@ -671,6 +620,96 @@ wait_until_primary_is_ready(Keeper *keeper,
 		return false;
 	}
 
+	/* Now make sure the replication slot has been created on the primary */
+	return wait_until_primary_has_created_our_replication_slot(keeper,
+															   assignedState);
+}
+
+
+/*
+ * wait_until_primary_has_created_our_replication_slot loops over querying the
+ * primary server until it has created our replication slot.
+ *
+ * When assigned CATCHINGUP_STATE, in some cases the primary might not be ready
+ * yet. That might happen when all the other standby nodes are in maintenance
+ * and the primary is already in the WAIT_PRIMARY state.
+ */
+static bool
+wait_until_primary_has_created_our_replication_slot(Keeper *keeper,
+													MonitorAssignedState *assignedState)
+{
+	int errors = 0, tries = 0;
+	bool firstLoop = true;
+
+	KeeperConfig *config = &(keeper->config);
+	LocalPostgresServer *postgres = &(keeper->postgres);
+	ReplicationSource *upstream = &(postgres->replicationSource);
+	NodeAddress primaryNode = { 0 };
+
+	bool hasReplicationSlot = false;
+
+	if (!keeper_get_primary(keeper, &primaryNode))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!standby_init_replication_source(postgres,
+										 &primaryNode,
+										 PG_AUTOCTL_REPLICA_USERNAME,
+										 config->replication_password,
+										 config->replication_slot_name,
+										 config->maximum_backup_rate,
+										 config->backupDirectory,
+										 NULL, /* no targetLSN */
+										 config->pgSetup.ssl,
+										 assignedState->nodeId))
+	{
+		/* can't happen at the moment */
+		return false;
+	}
+
+	do {
+		if (firstLoop)
+		{
+			firstLoop = false;
+		}
+		else
+		{
+			sleep(PG_AUTOCTL_KEEPER_SLEEP_TIME);
+		}
+
+		if (!upstream_has_replication_slot(upstream,
+										   &(config->pgSetup),
+										   &hasReplicationSlot))
+		{
+			++errors;
+
+			log_warn("Failed to contact the primary node %d \"%s\" (%s:%d)",
+					 primaryNode.nodeId,
+					 primaryNode.name,
+					 primaryNode.host,
+					 primaryNode.port);
+
+			if (errors > 5)
+			{
+				log_error("Failed to contact the primary 5 times in a row now, "
+						  "so we stop trying. You can do `pg_autoctl create` "
+						  "to retry and finish the local setup");
+				return false;
+			}
+		}
+
+		++tries;
+
+		if (!hasReplicationSlot && tries == 3)
+		{
+			log_info("Still waiting for the to create our replication slot");
+			log_warn("Please make sure that the primary node is currently "
+					 "running `pg_autoctl run` and contacting the monitor.");
+		}
+	} while (!hasReplicationSlot);
+
 	return true;
 }
 
@@ -689,7 +728,7 @@ wait_until_primary_is_ready(Keeper *keeper,
  * shared_preload_libraries = 'citus' entry, so we can proceed with create
  * extension citus after the restart.
  */
-static bool
+bool
 create_database_and_extension(Keeper *keeper)
 {
 	KeeperConfig *config = &(keeper->config);
@@ -701,17 +740,16 @@ create_database_and_extension(Keeper *keeper)
 	PostgresSetup initPgSetup = { 0 };
 	bool missingPgdataIsOk = false;
 	bool pgIsNotRunningIsOk = true;
-
-	char *pg_regress_sock_dir = getenv("PG_REGRESS_SOCK_DIR");
-
 	char hbaFilePath[MAXPGPATH];
 
+	log_trace("create_database_and_extension");
+
 	/* we didn't start PostgreSQL yet, also we just ran initdb */
-	snprintf(hbaFilePath, MAXPGPATH, "%s/pg_hba.conf", pgSetup->pgdata);
+	sformat(hbaFilePath, MAXPGPATH, "%s/pg_hba.conf", pgSetup->pgdata);
 
 	/*
 	 * The Postgres URI given to the user by our facility is going to use
-	 * --dbname and --nodename, as per the following command:
+	 * --dbname and --hostname, as per the following command:
 	 *
 	 *   $ pg_autoctl show uri --formation default
 	 *
@@ -719,30 +757,58 @@ create_database_and_extension(Keeper *keeper)
 	 * string with at least the --username used to create the database.
 	 */
 	if (!pghba_ensure_host_rule_exists(hbaFilePath,
+									   pgSetup->ssl.active,
 									   HBA_DATABASE_DBNAME,
 									   pgSetup->dbname,
 									   pg_setup_get_username(pgSetup),
-									   config->nodename,
-									   "trust"))
+									   config->hostname,
+									   pg_setup_get_auth_method(pgSetup),
+									   pgSetup->hbaLevel))
 	{
 		log_error("Failed to edit \"%s\" to grant connections to \"%s\", "
-				  "see above for details", hbaFilePath, config->nodename);
+				  "see above for details", hbaFilePath, config->hostname);
 		return false;
+	}
+
+	/*
+	 * When --pg-hba-lan is used, we also open the local network CIDR
+	 * connections for the given --username and --dbname.
+	 */
+	if (pgSetup->hbaLevel == HBA_EDIT_LAN)
+	{
+		if (!pghba_enable_lan_cidr(&keeper->postgres.sqlClient,
+								   keeper->config.pgSetup.ssl.active,
+								   HBA_DATABASE_DBNAME,
+								   keeper->config.pgSetup.dbname,
+								   keeper->config.hostname,
+								   pg_setup_get_username(pgSetup),
+								   pg_setup_get_auth_method(pgSetup),
+								   pgSetup->hbaLevel,
+								   pgSetup->pgdata))
+		{
+			log_error("Failed to grant local network connections in HBA");
+			return false;
+		}
 	}
 
 	/*
 	 * In test environments using PG_REGRESS_SOCK_DIR="" to disable unix socket
 	 * directory, we have to connect to the address from pghost.
 	 */
-	if (pg_regress_sock_dir != NULL
-		&& strcmp(pg_regress_sock_dir, "") == 0)
+	if (env_found_empty("PG_REGRESS_SOCK_DIR"))
 	{
 		log_info("Granting connection from \"%s\" in \"%s\"",
 				 pgSetup->pghost, hbaFilePath);
 
+		/* Intended use is restricted to unit testing, hard-code "trust" here */
 		if (!pghba_ensure_host_rule_exists(hbaFilePath,
-										   HBA_DATABASE_ALL, NULL, NULL,
-										   pgSetup->pghost, "trust"))
+										   pgSetup->ssl.active,
+										   HBA_DATABASE_ALL,
+										   NULL, /* all: no database name */
+										   NULL, /* no username, "all" */
+										   pgSetup->pghost,
+										   "trust",
+										   HBA_EDIT_MINIMAL))
 		{
 			log_error("Failed to edit \"%s\" to grant connections to \"%s\", "
 					  "see above for details", hbaFilePath, pgSetup->pghost);
@@ -767,29 +833,43 @@ create_database_and_extension(Keeper *keeper)
 	local_postgres_init(&initPostgres, &initPgSetup);
 
 	/*
-	 * Now start the database, we need to create our dbname and maybe the Citus
-	 * Extension too.
+	 * When --ssl-self-signed has been used, now is the time to build a
+	 * self-signed certificate for the server. We place the certificate and
+	 * private key in $PGDATA/server.key and $PGDATA/server.crt
 	 */
-	if (!ensure_local_postgres_is_running(&initPostgres))
+	if (!keeper_create_self_signed_cert(keeper))
 	{
-		log_error("Failed to start PostgreSQL, see above for details");
+		/* errors have already been logged */
 		return false;
 	}
 
+	/* publish our new pgSetup to the caller postgres state too */
+	postgres->postgresSetup.ssl = initPostgres.postgresSetup.ssl;
+
 	/*
-	 * If username was set in the setup and doesn't exist we need to create it.
+	 * Ensure pg_stat_statements is available in the server extension dir used
+	 * to create the Postgres instance. We only search for the control file to
+	 * offer better diagnostics in the logs in case the following CREATE
+	 * EXTENSION fails.
 	 */
-	if (!IS_EMPTY_STRING_BUFFER(pgSetup->username))
+	if (!find_extension_control_file(config->pgSetup.pg_ctl,
+									 "pg_stat_statements"))
 	{
-		if (!pgsql_create_user(&initPostgres.sqlClient, pgSetup->username,
-							   /* password, login, superuser, replication */
-							   NULL, true, true, false))
+		log_warn("Failed to find extension control file for "
+				 "\"pg_stat_statements\"");
+	}
 
+	/*
+	 * Ensure citus extension is available in the server extension dir used to
+	 * create the Postgres instance. We only search for the control file to
+	 * offer better diagnostics in the logs in case the following CREATE
+	 * EXTENSION fails.
+	 */
+	if (IS_CITUS_INSTANCE_KIND(postgres->pgKind))
+	{
+		if (!find_extension_control_file(config->pgSetup.pg_ctl, "citus"))
 		{
-			log_fatal("Failed to create role \"%s\""
-					  ", see above for details", pgSetup->username);
-
-			return false;
+			log_warn("Failed to find extension control file for \"citus\"");
 		}
 	}
 
@@ -806,18 +886,30 @@ create_database_and_extension(Keeper *keeper)
 	}
 
 	/*
-	 * Now allow nodes on the same network to connect to the coordinator, and
-	 * the coordinator to connect to its workers.
+	 * Now start the database, we need to create our dbname and maybe the Citus
+	 * Extension too.
 	 */
-	if (IS_CITUS_INSTANCE_KIND(postgres->pgKind))
+	if (!ensure_postgres_service_is_running(&initPostgres))
 	{
-		(void) pghba_enable_lan_cidr(&initPostgres.sqlClient,
-									 HBA_DATABASE_DBNAME,
-									 pgSetup->dbname,
-									 config->nodename,
-									 pg_setup_get_username(pgSetup),
-									 "trust",
-									 NULL);
+		log_error("Failed to start PostgreSQL, see above for details");
+		return false;
+	}
+
+	/*
+	 * If username was set in the setup and doesn't exist we need to create it.
+	 */
+	if (!IS_EMPTY_STRING_BUFFER(pgSetup->username))
+	{
+		if (!pgsql_create_user(&initPostgres.sqlClient, pgSetup->username,
+
+		                       /* password, login, superuser, replication, connlimit */
+							   NULL, true, true, false, -1))
+		{
+			log_fatal("Failed to create role \"%s\""
+					  ", see above for details", pgSetup->username);
+
+			return false;
+		}
 	}
 
 	/*
@@ -838,22 +930,35 @@ create_database_and_extension(Keeper *keeper)
 					  pgSetup->dbname, pgSetup->username);
 			return false;
 		}
-
 	}
 
 	/* close the "template1" connection now */
 	pgsql_finish(&initPostgres.sqlClient);
 
 	/*
-	 * Because we did create the PostgreSQL cluster in this function, we feel
-	 * free to restart it to make sure that the defaults we just installed are
-	 * actually in place.
+	 * Connect to Postgres as the system user to create extension: same user as
+	 * initdb with superuser privileges.
+	 *
+	 * Calling keeper_update_state will re-init our sqlClient to now connect
+	 * per the configuration settings, cleaning-up the local changes we made
+	 * before.
 	 */
-
-	if (!keeper_restart_postgres(keeper))
+	if (!keeper_update_pg_state(keeper))
 	{
-		log_fatal("Failed to restart PostgreSQL to enable pg_auto_failover "
-				  "configuration");
+		log_error("Failed to update the keeper's state from the local "
+				  "PostgreSQL instance, see above for details.");
+		return false;
+	}
+
+	/*
+	 * Install the pg_stat_statements extension in that database, skipping if
+	 * the extension has already been installed.
+	 */
+	log_info("CREATE EXTENSION pg_stat_statements;");
+
+	if (!pgsql_create_extension(&(postgres->sqlClient), "pg_stat_statements"))
+	{
+		log_error("Failed to create extension pg_stat_statements");
 		return false;
 	}
 
@@ -865,25 +970,38 @@ create_database_and_extension(Keeper *keeper)
 	if (IS_CITUS_INSTANCE_KIND(postgres->pgKind))
 	{
 		/*
+		 * Now allow nodes on the same network to connect to the coordinator,
+		 * and the coordinator to connect to its workers.
+		 */
+		if (!pghba_enable_lan_cidr(&initPostgres.sqlClient,
+								   pgSetup->ssl.active,
+								   HBA_DATABASE_DBNAME,
+								   pgSetup->dbname,
+								   config->hostname,
+								   pg_setup_get_username(pgSetup),
+								   pg_setup_get_auth_method(pgSetup),
+								   pgSetup->hbaLevel,
+								   NULL))
+		{
+			log_error("Failed to grant local network connections in HBA");
+			return false;
+		}
+
+		/*
 		 * Install the citus extension in that database, skipping if the
 		 * extension has already been installed.
 		 */
 		log_info("CREATE EXTENSION %s;", CITUS_EXTENSION_NAME);
-
-		/*
-		 * Connect to pgsql as the system user to create extension: Same
-		 * user as initdb with superuser privileges.
-		 */
 
 		if (!pgsql_create_extension(&(postgres->sqlClient), CITUS_EXTENSION_NAME))
 		{
 			log_error("Failed to create extension %s", CITUS_EXTENSION_NAME);
 			return false;
 		}
-
-		/* and we're done with this connection. */
-		pgsql_finish(pgsql);
 	}
+
+	/* and we're done with this connection. */
+	pgsql_finish(pgsql);
 
 	return true;
 }
@@ -919,13 +1037,11 @@ keeper_pg_init_node_active(Keeper *keeper)
 
 	if (!monitor_node_active(&(keeper->monitor),
 							 keeper->config.formation,
-							 keeper->config.nodename,
-							 keeper->config.pgSetup.pgport,
 							 keeper->state.current_node_id,
 							 keeper->state.current_group,
 							 keeper->state.current_role,
 							 ReportPgIsRunning(keeper),
-							 keeper->postgres.walLag,
+							 keeper->postgres.currentLSN,
 							 keeper->postgres.pgsrSyncState,
 							 &assignedState))
 	{

@@ -14,6 +14,8 @@
 
 #include "config.h"
 #include "defaults.h"
+#include "env_utils.h"
+#include "file_utils.h"
 #include "ini_file.h"
 #include "keeper.h"
 #include "keeper_config.h"
@@ -33,12 +35,14 @@ build_xdg_path(char *dst,
 			   const char *name)
 {
 	char filename[MAXPGPATH];
-	char *home = getenv("HOME");
-	char *xdg_topdir;
+	char home[MAXPGPATH];
+	char fallback[MAXPGPATH];
+	char xdg_topdir[MAXPGPATH];
+	char *envVarName = NULL;
 
-	if (home == NULL)
+	if (!get_env_copy("HOME", home, MAXPGPATH))
 	{
-		log_fatal("Environment variable HOME is unset");
+		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
@@ -46,25 +50,22 @@ build_xdg_path(char *dst,
 	{
 		case XDG_DATA:
 		{
-			xdg_topdir = getenv("XDG_DATA_HOME");
+			join_path_components(fallback, home, ".local/share");
+			envVarName = "XDG_DATA_HOME";
 			break;
 		}
 
 		case XDG_CONFIG:
 		{
-			xdg_topdir = getenv("XDG_CONFIG_HOME");
+			join_path_components(fallback, home, ".config");
+			envVarName = "XDG_CONFIG_HOME";
 			break;
 		}
 
 		case XDG_RUNTIME:
 		{
-			xdg_topdir = getenv("XDG_RUNTIME_DIR");
-
-			if (xdg_topdir == NULL || !directory_exists(xdg_topdir))
-			{
-				/* then default to /tmp */
-				xdg_topdir = "/tmp";
-			}
+			strlcpy(fallback, "/tmp", MAXPGPATH);
+			envVarName = "XDG_RUNTIME_DIR";
 			break;
 		}
 
@@ -75,40 +76,20 @@ build_xdg_path(char *dst,
 			return false;
 	}
 
-	if (xdg_topdir != NULL)
+	if (!get_env_copy_with_fallback(envVarName, xdg_topdir, MAXPGPATH, fallback))
 	{
-		/* use e.g. ${XDG_DATA_HOME}/pg_autoctl/<PGDATA>/pg_autoctl.state */
-		strlcpy(filename, xdg_topdir, MAXPGPATH);
-	}
-	else
-	{
-		/* use e.g. ${HOME}/.local/share/pg_autoctl/<PGDATA>/pg_autoctl.state */
-		strlcpy(filename, home, MAXPGPATH);
-
-		switch (xdgType)
-		{
-			case XDG_DATA:
-			{
-				join_path_components(filename, filename, ".local/share");
-				break;
-			}
-
-			case XDG_CONFIG:
-			{
-				join_path_components(filename, filename, ".config");
-				break;
-			}
-
-			default:
-
-				/* can not happen given previous switch */
-				log_error("No support for XDG Resource Type %d", xdgType);
-				return false;
-		}
+		/* errors have already been logged */
+		return false;
 	}
 
-	join_path_components(filename, filename, "pg_autoctl");
+	if (xdgType == XDG_RUNTIME && !directory_exists(xdg_topdir))
+	{
+		strlcpy(xdg_topdir, "/tmp", MAXPGPATH);
+	}
 
+	join_path_components(filename, xdg_topdir, "pg_autoctl");
+
+	/* append PGDATA now */
 	if (pgdata[0] == '/')
 	{
 		/* skip the first / to avoid having a double-slash in the name */
@@ -125,12 +106,11 @@ build_xdg_path(char *dst,
 		 * yet, precluding the use of realpath(3) to get the absolute name
 		 * here.
 		 */
-		char currentWorkingDirectory[MAXPGPATH];
+		char currentWorkingDirectory[MAXPGPATH] = { 0 };
 
 		if (getcwd(currentWorkingDirectory, MAXPGPATH) == NULL)
 		{
-			log_error("Failed to get the current working directory: %s",
-					  strerror(errno));
+			log_error("Failed to get the current working directory: %m");
 			return false;
 		}
 
@@ -144,20 +124,19 @@ build_xdg_path(char *dst,
 	/* mkdir -p the target directory */
 	if (pg_mkdir_p(filename, 0755) == -1)
 	{
-		log_error("Failed to create state directory \"%s\": %s",
-				  filename, strerror(errno));
+		log_error("Failed to create state directory \"%s\": %m", filename);
 		return false;
 	}
 
-	/* and finally add the configuration file name */
-	join_path_components(filename, filename, name);
-
-	/* normalize the path to the configuration file, if it exists */
+	/* normalize the existing path to the configuration file */
 	if (!normalize_filename(filename, dst, MAXPGPATH))
 	{
 		/* errors have already been logged */
 		return false;
 	}
+
+	/* and finally add the configuration file name */
+	join_path_components(dst, dst, name);
 
 	return true;
 }
@@ -180,7 +159,7 @@ SetConfigFilePath(ConfigFilePaths *pathnames, const char *pgdata)
 		{
 			log_error("Failed to build our configuration file pathname, "
 					  "see above.");
-			exit(EXIT_CODE_INTERNAL_ERROR);
+			return false;
 		}
 	}
 
@@ -209,7 +188,7 @@ SetStateFilePath(ConfigFilePaths *pathnames, const char *pgdata)
 		{
 			log_error("Failed to build pg_autoctl state file pathname, "
 					  "see above.");
-			exit(EXIT_CODE_INTERNAL_ERROR);
+			return false;
 		}
 	}
 	log_trace("SetStateFilePath: \"%s\"", pathnames->state);
@@ -220,14 +199,42 @@ SetStateFilePath(ConfigFilePaths *pathnames, const char *pgdata)
 		if (!build_xdg_path(pathnames->init,
 							XDG_DATA,
 							pgdata,
-							KEEPER_INIT_FILENAME))
+							KEEPER_INIT_STATE_FILENAME))
 		{
 			log_error("Failed to build pg_autoctl init state file pathname, "
 					  "see above.");
-			exit(EXIT_CODE_INTERNAL_ERROR);
+			return false;
 		}
 	}
 	log_trace("SetKeeperStateFilePath: \"%s\"", pathnames->init);
+
+	return true;
+}
+
+
+/*
+ * SetNodesFilePath sets config.pathnames.nodes from our PGDATA value, and
+ * using the XDG Base Directory Specification for a data file. Per specs at:
+ *
+ *   https://standards.freedesktop.org/basedir-spec/basedir-spec-latest.html
+ *
+ */
+bool
+SetNodesFilePath(ConfigFilePaths *pathnames, const char *pgdata)
+{
+	if (IS_EMPTY_STRING_BUFFER(pathnames->nodes))
+	{
+		if (!build_xdg_path(pathnames->nodes,
+							XDG_DATA,
+							pgdata,
+							KEEPER_NODES_FILENAME))
+		{
+			log_error("Failed to build pg_autoctl state file pathname, "
+					  "see above.");
+			return false;
+		}
+	}
+	log_trace("SetNodesFilePath: \"%s\"", pathnames->nodes);
 
 	return true;
 }
@@ -249,7 +256,7 @@ SetPidFilePath(ConfigFilePaths *pathnames, const char *pgdata)
 		{
 			log_error("Failed to build pg_autoctl pid file pathname, "
 					  "see above.");
-			exit(EXIT_CODE_INTERNAL_ERROR);
+			return false;
 		}
 	}
 
@@ -309,36 +316,61 @@ ProbeConfigurationFileRole(const char *filename)
 
 
 /*
- * normalize_filename returns the real path of a given filename, resolving
- * symlinks and pruning double-slashes and other weird constructs.
+ * config_accept_new_ssloptions allows to reload SSL options at runtime.
  */
 bool
-normalize_filename(const char *filename, char *dst, int size)
+config_accept_new_ssloptions(PostgresSetup *pgSetup, PostgresSetup *newPgSetup)
 {
-	/* normalize the path to the configuration file, if it exists */
-	if (file_exists(filename))
+	if (pgSetup->ssl.active != newPgSetup->ssl.active)
 	{
-		char realPath[PATH_MAX];
-
-		if (realpath(filename, realPath) == NULL)
-		{
-			log_fatal("Failed to normalize file name \"%s\": %s",
-					  filename, strerror(errno));
-			return false;
-		}
-
-		if (strlcpy(dst, realPath, size) >= size)
-		{
-			log_fatal("Real path \"%s\" is %d bytes long, and pg_autoctl "
-					  "is limited to handling paths of %d bytes long, maximum",
-					  realPath, (int) strlen(realPath), size);
-			return false;
-		}
+		log_info("Reloading configuration: ssl is now %s; used to be %s",
+				 newPgSetup->ssl.active ? "active" : "disabled",
+				 pgSetup->ssl.active ? "active" : "disabled");
 	}
-	else
+
+	if (pgSetup->ssl.sslMode != newPgSetup->ssl.sslMode)
 	{
-		strlcpy(dst, filename, MAXPGPATH);
+		log_info("Reloading configuration: sslmode is now \"%s\"; "
+				 "used to be \"%s\"",
+				 pgsetup_sslmode_to_string(newPgSetup->ssl.sslMode),
+				 pgsetup_sslmode_to_string(pgSetup->ssl.sslMode));
 	}
+
+	if (strneq(pgSetup->ssl.caFile, newPgSetup->ssl.caFile))
+	{
+		log_info("Reloading configuration: ssl CA file is now \"%s\"; "
+				 "used to be \"%s\"",
+				 newPgSetup->ssl.caFile, pgSetup->ssl.caFile);
+	}
+
+	if (strneq(pgSetup->ssl.crlFile, newPgSetup->ssl.crlFile))
+	{
+		log_info("Reloading configuration: ssl CRL file is now \"%s\"; "
+				 "used to be \"%s\"",
+				 newPgSetup->ssl.crlFile, pgSetup->ssl.crlFile);
+	}
+
+	if (strneq(pgSetup->ssl.serverCert, newPgSetup->ssl.serverCert))
+	{
+		log_info("Reloading configuration: ssl server cert file is now \"%s\"; "
+				 "used to be \"%s\"",
+				 newPgSetup->ssl.serverCert,
+				 pgSetup->ssl.serverCert);
+	}
+
+	if (strneq(pgSetup->ssl.serverKey, newPgSetup->ssl.serverKey))
+	{
+		log_info("Reloading configuration: ssl server key file is now \"%s\"; "
+				 "used to be \"%s\"",
+				 newPgSetup->ssl.serverKey,
+				 pgSetup->ssl.serverKey);
+	}
+
+	/* install the new SSL settings, wholesale */
+	pgSetup->ssl = newPgSetup->ssl;
+	strlcpy(pgSetup->ssl.sslModeStr,
+			pgsetup_sslmode_to_string(pgSetup->ssl.sslMode),
+			SSL_MODE_STRLEN);
 
 	return true;
 }

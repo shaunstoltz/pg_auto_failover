@@ -23,8 +23,12 @@
 #include "pghba.h"
 #include "pgsetup.h"
 #include "pgsql.h"
+#include "pidfile.h"
 #include "primary_standby.h"
-
+#include "service_monitor.h"
+#include "service_monitor_init.h"
+#include "service_postgres.h"
+#include "signals.h"
 
 /*
  * Default settings for PostgreSQL instance when running the pg_auto_failover
@@ -32,8 +36,24 @@
  */
 GUC monitor_default_settings[] = {
 	{ "shared_preload_libraries", "'pgautofailover'" },
+	{ "cluster_name", "'pg_auto_failover monitor'" },
 	{ "listen_addresses", "'*'" },
 	{ "port", "5432" },
+	{ "log_destination", "stderr" },
+	{ "logging_collector", "on" },
+	{ "log_directory", "log" },
+	{ "log_min_messages", "info" },
+	{ "log_connections", "off" },
+	{ "log_disconnections", "off" },
+	{ "log_lock_waits", "on" },
+	{ "log_statement", "ddl" },
+	{ "password_encryption", "md5" },
+	{ "ssl", "off" },
+	{ "ssl_ca_file", "" },
+	{ "ssl_crl_file", "" },
+	{ "ssl_cert_file", "" },
+	{ "ssl_key_file", "" },
+	{ "ssl_ciphers", "'" DEFAULT_SSL_CIPHERS "'" },
 #ifdef TEST
 	{ "unix_socket_directories", "''" },
 #endif
@@ -41,111 +61,59 @@ GUC monitor_default_settings[] = {
 };
 
 
-static bool monitor_install(const char *nodename,
-							PostgresSetup pgSetupOption, bool checkSettings);
 static bool check_monitor_settings(PostgresSetup pgSetup);
 
 
 /*
- * monitor_pg_init initialises a pg_auto_failover monitor PostgreSQL cluster,
- * either from scratch using `pg_ctl initdb`, or creating a new database in an
- * existing cluster.
+ * monitor_pg_init initializes a pg_auto_failover monitor PostgreSQL cluster
+ * from scratch using `pg_ctl initdb`.
  */
 bool
-monitor_pg_init(Monitor *monitor, MonitorConfig *config)
+monitor_pg_init(Monitor *monitor)
 {
-	char configFilePath[MAXPGPATH];
-	char postgresUri[MAXCONNINFO];
-	PostgresSetup pgSetup = config->pgSetup;
-	bool postgresInstanceExists = pg_setup_pgdata_exists(&pgSetup);
+	MonitorConfig *config = &(monitor->config);
+	PostgresSetup *pgSetup = &(config->pgSetup);
 
-	if (directory_exists(pgSetup.pgdata))
+	if (pg_setup_pgdata_exists(pgSetup))
 	{
 		PostgresSetup existingPgSetup = { 0 };
 		bool missing_pgdata_is_ok = true;
 		bool pg_is_not_running_is_ok = true;
 
-		if (!pg_setup_init(&existingPgSetup, &pgSetup,
+		if (!pg_setup_init(&existingPgSetup, pgSetup,
 						   missing_pgdata_is_ok,
 						   pg_is_not_running_is_ok))
 		{
-			log_fatal("Failed to initialise a monitor node, "
+			log_fatal("Failed to initialize a monitor node, "
 					  "see above for details");
 			return false;
 		}
 
 		if (pg_setup_is_running(&existingPgSetup))
 		{
-			log_info("Installing pg_auto_failover monitor in existing "
-					 "PostgreSQL instance at \"%s\" running on port %d",
-					 pgSetup.pgdata, existingPgSetup.pidFile.port);
+			log_error("Installing pg_auto_failover monitor in existing "
+					  "PostgreSQL instance at \"%s\" running on port %d "
+					  "is not supported.",
+					  pgSetup->pgdata, existingPgSetup.pidFile.port);
 
-			if (!monitor_install(config->nodename, existingPgSetup, true))
-			{
-				log_fatal("Failed to install pg_auto_failover monitor, "
-						  "see above for details");
-				return false;
-			}
-
-			/* and we're done now! */
-			return true;
+			return false;
 		}
-
-		if (pg_setup_pgdata_exists(&existingPgSetup))
+	}
+	else
+	{
+		if (!pg_ctl_initdb(pgSetup->pg_ctl, pgSetup->pgdata))
 		{
-			log_fatal("PGDATA directory \"%s\" already exists, skipping",
-					  pgSetup.pgdata);
+			log_fatal("Failed to initialize a PostgreSQL instance at \"%s\", "
+					  "see above for details", pgSetup->pgdata);
 			return false;
 		}
 	}
 
-	if (!pg_ctl_initdb(pgSetup.pg_ctl, pgSetup.pgdata))
+	if (!monitor_add_postgres_default_settings(monitor))
 	{
-		log_fatal("Failed to initialise a PostgreSQL instance at \"%s\", "
-				  "see above for details", pgSetup.pgdata);
+		log_fatal("Failed to initialize our Postgres settings, "
+				  "see above for details");
 		return false;
-	}
-
-	/*
-	 * We managed to initdb, refresh our configuration file location with
-	 * the realpath(3): we might have been given a relative pathname.
-	 */
-	if (!monitor_config_update_with_absolute_pgdata(config))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/*
-	 * We just did the initdb ourselves, so we know where the configuration
-	 * file is to be found Also, we didn't start PostgreSQL yet.
-	 */
-	join_path_components(configFilePath, pgSetup.pgdata, "postgresql.conf");
-
-	if (!pg_add_auto_failover_default_settings(&pgSetup, configFilePath,
-											   monitor_default_settings))
-	{
-		log_error("Failed to add default settings to \"%s\".conf: couldn't "
-				  "write the new postgresql.conf, see above for details",
-				  configFilePath);
-		return false;
-	}
-
-	if (!pg_ctl_start(pgSetup.pg_ctl,
-					  pgSetup.pgdata, pgSetup.pgport, pgSetup.listen_addresses))
-	{
-		log_error("Failed to start postgres, see above");
-		return false;
-	}
-
-	if (!monitor_install(config->nodename, pgSetup, false))
-	{
-		return false;
-	}
-
-	if (monitor_config_get_postgres_uri(config, postgresUri, MAXCONNINFO))
-	{
-		log_info("pg_auto_failover monitor is ready at %s", postgresUri);
 	}
 
 	return true;
@@ -161,12 +129,12 @@ monitor_pg_init(Monitor *monitor, MonitorConfig *config)
  *  - create extension pgautofailover;
  */
 bool
-monitor_install(const char *nodename,
+monitor_install(const char *hostname,
 				PostgresSetup pgSetupOption, bool checkSettings)
 {
 	PostgresSetup pgSetup = { 0 };
 	bool missingPgdataIsOk = false;
-	bool pgIsNotRunningIsOk = false;
+	bool pgIsNotRunningIsOk = true;
 	LocalPostgresServer postgres = { 0 };
 	char connInfo[MAXCONNINFO];
 
@@ -176,21 +144,46 @@ monitor_install(const char *nodename,
 
 	/*
 	 * We might have just started a PostgreSQL instance, so we want to recheck
-	 * the PostgreSQL setup. Also this time we make sure PostgreSQL is running,
-	 * which the rest of this function assumes.
+	 * the PostgreSQL setup.
 	 */
 	if (!pg_setup_init(&pgSetup, &pgSetupOption,
 					   missingPgdataIsOk, pgIsNotRunningIsOk))
 	{
-		log_fatal("Failed to initialise a monitor node, see above for details");
+		log_fatal("Failed to initialize a monitor node, see above for details");
 		exit(EXIT_CODE_PGCTL);
 	}
 
-	local_postgres_init(&postgres, &pgSetup);
+	(void) local_postgres_init(&postgres, &pgSetup);
+
+	/*
+	 * Now allow nodes on the same network to connect to pg_auto_failover
+	 * database.
+	 */
+	if (!pghba_enable_lan_cidr(&postgres.sqlClient,
+							   pgSetup.ssl.active,
+							   HBA_DATABASE_DBNAME,
+							   PG_AUTOCTL_MONITOR_DBNAME,
+							   hostname,
+							   PG_AUTOCTL_MONITOR_USERNAME,
+							   pg_setup_get_auth_method(&pgSetup),
+							   pgSetup.hbaLevel,
+							   pgSetup.pgdata))
+	{
+		log_warn("Failed to grant connection to local network.");
+		return false;
+	}
+
+	if (!ensure_postgres_service_is_running(&postgres))
+	{
+		log_error("Failed to install pg_auto_failover in the monitor's "
+				  "Postgres database, see above for details");
+		return false;
+	}
 
 	if (!pgsql_create_user(&postgres.sqlClient, PG_AUTOCTL_MONITOR_DBOWNER,
-	                       /* password, login, superuser, replication */
-						   NULL, true, false, false))
+
+	                       /* password, login, superuser, replication, connlimit */
+						   NULL, true, false, false, -1))
 	{
 		log_error("Failed to create user \"%s\" on local postgres server",
 				  PG_AUTOCTL_MONITOR_DBOWNER);
@@ -206,35 +199,29 @@ monitor_install(const char *nodename,
 		return false;
 	}
 
-	/* we're done with that connection to "postgres" database */
-	pgsql_finish(&postgres.sqlClient);
-
 	/* now, connect to the newly created database to create our extension */
 	strlcpy(pgSetup.dbname, PG_AUTOCTL_MONITOR_DBNAME, NAMEDATALEN);
 	pg_setup_get_local_connection_string(&pgSetup, connInfo);
-	pgsql_init(&postgres.sqlClient, connInfo);
+	pgsql_init(&postgres.sqlClient, connInfo, PGSQL_CONN_LOCAL);
+
+	/*
+	 * Ensure our extension "pgautofailvover" is available in the server
+	 * extension dir used to create the Postgres instance. We only search for
+	 * the control file to offer better diagnostics in the logs in case the
+	 * following CREATE EXTENSION fails.
+	 */
+	if (!find_extension_control_file(pgSetup.pg_ctl,
+									 PG_AUTOCTL_MONITOR_EXTENSION_NAME))
+	{
+		log_warn("Failed to find extension control file for \"%s\"",
+				 PG_AUTOCTL_MONITOR_EXTENSION_NAME);
+	}
 
 	if (!pgsql_create_extension(&postgres.sqlClient,
 								PG_AUTOCTL_MONITOR_EXTENSION_NAME))
 	{
 		log_error("Failed to create extension %s",
 				  PG_AUTOCTL_MONITOR_EXTENSION_NAME);
-		return false;
-	}
-
-	/*
-	 * Now allow nodes on the same network to connect to pg_auto_failover
-	 * database.
-	 */
-	if (!pghba_enable_lan_cidr(&postgres.sqlClient,
-							   HBA_DATABASE_DBNAME,
-							   PG_AUTOCTL_MONITOR_DBNAME,
-							   nodename,
-							   PG_AUTOCTL_MONITOR_USERNAME,
-							   pg_setup_get_auth_method(&pgSetup),
-							   NULL))
-	{
-		log_warn("Failed to grant connection to local network.");
 		return false;
 	}
 
@@ -252,8 +239,6 @@ monitor_install(const char *nodename,
 			return false;
 		}
 	}
-
-	pgsql_finish(&postgres.sqlClient);
 
 	log_info("Your pg_auto_failover monitor instance is now ready on port %d.",
 			 pgSetup.pgport);
@@ -274,7 +259,7 @@ check_monitor_settings(PostgresSetup pgSetup)
 	bool settingsAreOk = false;
 
 	pg_setup_get_local_connection_string(&pgSetup, connInfo);
-	pgsql_init(&postgres.sqlClient, connInfo);
+	pgsql_init(&postgres.sqlClient, connInfo, PGSQL_CONN_LOCAL);
 
 	if (!pgsql_check_monitor_settings(&(postgres.sqlClient), &settingsAreOk))
 	{
@@ -298,4 +283,65 @@ check_monitor_settings(PostgresSetup pgSetup)
 	}
 
 	return settingsAreOk;
+}
+
+
+/*
+ * monitor_add_postgres_default_settings adds the monitor Postgres setup.
+ */
+bool
+monitor_add_postgres_default_settings(Monitor *monitor)
+{
+	MonitorConfig *config = &(monitor->config);
+	PostgresSetup *pgSetup = &(config->pgSetup);
+	char configFilePath[MAXPGPATH] = { 0 };
+
+	/*
+	 * We managed to initdb, refresh our configuration file location with
+	 * the realpath(3): we might have been given a relative pathname.
+	 */
+	if (!monitor_config_update_with_absolute_pgdata(config))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * We just did the initdb ourselves, so we know where the configuration
+	 * file is to be found Also, we didn't start PostgreSQL yet.
+	 */
+	join_path_components(configFilePath, pgSetup->pgdata, "postgresql.conf");
+
+	/*
+	 * When --ssl-self-signed has been used, now is the time to build a
+	 * self-signed certificate for the server. We place the certificate and
+	 * private key in $PGDATA/server.key and $PGDATA/server.crt
+	 */
+	if (pgSetup->ssl.createSelfSignedCert)
+	{
+		if (!pg_create_self_signed_cert(&(config->pgSetup), config->hostname))
+		{
+			log_error("Failed to create SSL self-signed certificate, "
+					  "see above for details");
+			return false;
+		}
+
+		/* update our configuration with ssl server.{key,cert} */
+		if (!monitor_config_write_file(config))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	if (!pg_add_auto_failover_default_settings(pgSetup, configFilePath,
+											   monitor_default_settings))
+	{
+		log_error("Failed to add default settings to \"%s\": couldn't "
+				  "write the new postgresql.conf, see above for details",
+				  configFilePath);
+		return false;
+	}
+
+	return true;
 }

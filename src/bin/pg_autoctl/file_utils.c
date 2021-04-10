@@ -7,6 +7,7 @@
  *
  */
 
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -16,11 +17,18 @@
 
 #include "postgres_fe.h"
 
+#include "snprintf.h"
+
 #include "cli_root.h"
 #include "defaults.h"
+#include "env_utils.h"
 #include "file_utils.h"
 #include "log.h"
 
+static bool read_file_internal(FILE *fileStream,
+							   const char *filePath,
+							   char **contents,
+							   long *fileSize);
 
 /*
  * file_exists returns true if the given filename is known to exist
@@ -42,8 +50,7 @@ file_exists(const char *filename)
 		 */
 		if (errno != ENOENT && errno != ENOTDIR)
 		{
-			log_error("Failed to check if file \"%s\" exists: %s",
-					  filename, strerror(errno));
+			log_error("Failed to check if file \"%s\" exists: %m", filename);
 		}
 		return false;
 	}
@@ -59,7 +66,6 @@ file_exists(const char *filename)
 bool
 directory_exists(const char *path)
 {
-	bool result = false;
 	struct stat info;
 
 	if (!file_exists(path))
@@ -69,11 +75,11 @@ directory_exists(const char *path)
 
 	if (stat(path, &info) != 0)
 	{
-		log_error("Failed to stat \"%s\": %s\n", path, strerror(errno));
+		log_error("Failed to stat \"%s\": %m\n", path);
 		return false;
 	}
 
-	result = (info.st_mode & S_IFMT) == S_IFDIR;
+	bool result = (info.st_mode & S_IFMT) == S_IFDIR;
 	return result;
 }
 
@@ -93,8 +99,7 @@ ensure_empty_dir(const char *dirname, int mode)
 	{
 		if (!rmtree(dirname, true))
 		{
-			log_error("Failed to remove directory \"%s\": %s",
-					  dirname, strerror(errno));
+			log_error("Failed to remove directory \"%s\": %m", dirname);
 			return false;
 		}
 	}
@@ -109,12 +114,56 @@ ensure_empty_dir(const char *dirname, int mode)
 
 	if (pg_mkdir_p(dirname_copy, mode) == -1)
 	{
-		log_error("Failed to ensure empty directory \"%s\": %s",
-				  dirname, strerror(errno));
+		log_error("Failed to ensure empty directory \"%s\": %m", dirname);
 		return false;
 	}
 
 	return true;
+}
+
+
+/*
+ * fopen_with_umask is a version of fopen that gives more control. The main
+ * advantage of it is that it allows specifying a umask of the file. This makes
+ * sure files are not accidentally created with umask 777 if the user has it
+ * configured in a weird way.
+ *
+ * This function returns NULL when opening the file fails. So this should be
+ * handled. It will log an error in this case though, so that's not necessary
+ * at the callsite.
+ */
+FILE *
+fopen_with_umask(const char *filePath, const char *modes, int flags, mode_t umask)
+{
+	int fileDescriptor = open(filePath, flags, umask);
+	if (fileDescriptor == -1)
+	{
+		log_error("Failed to open file \"%s\": %m", filePath);
+		return NULL;
+	}
+
+	FILE *fileStream = fdopen(fileDescriptor, modes);
+	if (fileStream == NULL)
+	{
+		log_error("Failed to open file \"%s\": %m", filePath);
+		close(fileDescriptor);
+	}
+	return fileStream;
+}
+
+
+/*
+ * fopen_read_only opens the file as a read only stream.
+ */
+FILE *
+fopen_read_only(const char *filePath)
+{
+	/*
+	 * Explanation of IGNORE-BANNED
+	 * fopen is safe here because we open the file in read only mode. So no
+	 * exclusive access is needed.
+	 */
+	return fopen(filePath, "rb"); /* IGNORE-BANNED */
 }
 
 
@@ -126,18 +175,17 @@ ensure_empty_dir(const char *dirname, int mode)
 bool
 write_file(char *data, long fileSize, const char *filePath)
 {
-	FILE *fileStream = NULL;
+	FILE *fileStream = fopen_with_umask(filePath, "wb", FOPEN_FLAGS_W, 0644);
 
-	fileStream = fopen(filePath, "wb");
 	if (fileStream == NULL)
 	{
-		log_error("Failed to open file \"%s\": %s", filePath, strerror(errno));
+		/* errors have already been logged */
 		return false;
 	}
 
 	if (fwrite(data, sizeof(char), fileSize, fileStream) < fileSize)
 	{
-		log_error("Failed to write file \"%s\": %s", filePath, strerror(errno));
+		log_error("Failed to write file \"%s\": %m", filePath);
 		fclose(fileStream);
 		return false;
 	}
@@ -160,18 +208,17 @@ write_file(char *data, long fileSize, const char *filePath)
 bool
 append_to_file(char *data, long fileSize, const char *filePath)
 {
-	FILE *fileStream = NULL;
+	FILE *fileStream = fopen_with_umask(filePath, "ab", FOPEN_FLAGS_A, 0644);
 
-	fileStream = fopen(filePath, "ab");
 	if (fileStream == NULL)
 	{
-		log_error("Failed to open file \"%s\": %s", filePath, strerror(errno));
+		/* errors have already been logged */
 		return false;
 	}
 
 	if (fwrite(data, sizeof(char), fileSize, fileStream) < fileSize)
 	{
-		log_error("Failed to write file \"%s\": %s", filePath, strerror(errno));
+		log_error("Failed to write file \"%s\": %m", filePath);
 		fclose(fileStream);
 		return false;
 	}
@@ -187,6 +234,34 @@ append_to_file(char *data, long fileSize, const char *filePath)
 
 
 /*
+ * read_file_if_exists is a utility function that reads the contents of a file
+ * using our logging library to report errors. ENOENT is not considered worth
+ * of a log message in this function, and we still return false in that case.
+ *
+ * If successful, the function returns true and fileSize points to the number
+ * of bytes that were read and contents points to a buffer containing the entire
+ * contents of the file. This buffer should be freed by the caller.
+ */
+bool
+read_file_if_exists(const char *filePath, char **contents, long *fileSize)
+{
+	/* open a file */
+	FILE *fileStream = fopen_read_only(filePath);
+
+	if (fileStream == NULL)
+	{
+		if (errno != ENOENT)
+		{
+			log_error("Failed to open file \"%s\": %m", filePath);
+		}
+		return false;
+	}
+
+	return read_file_internal(fileStream, filePath, contents, fileSize);
+}
+
+
+/*
  * read_file is a utility function that reads the contents of a file using our
  * logging library to report errors.
  *
@@ -197,21 +272,30 @@ append_to_file(char *data, long fileSize, const char *filePath)
 bool
 read_file(const char *filePath, char **contents, long *fileSize)
 {
-	char *data = NULL;
-	FILE *fileStream = NULL;
-
 	/* open a file */
-	fileStream = fopen(filePath, "rb");
+	FILE *fileStream = fopen_read_only(filePath);
 	if (fileStream == NULL)
 	{
-		log_error("Failed to open file \"%s\": %s", filePath, strerror(errno));
+		log_error("Failed to open file \"%s\": %m", filePath);
 		return false;
 	}
 
+	return read_file_internal(fileStream, filePath, contents, fileSize);
+}
+
+
+/*
+ * read_file_internal is shared by both read_file and read_file_if_exists
+ * functions.
+ */
+static bool
+read_file_internal(FILE *fileStream,
+				   const char *filePath, char **contents, long *fileSize)
+{
 	/* get the file size */
 	if (fseek(fileStream, 0, SEEK_END) != 0)
 	{
-		log_error("Failed to read file \"%s\": %s", filePath, strerror(errno));
+		log_error("Failed to read file \"%s\": %m", filePath);
 		fclose(fileStream);
 		return false;
 	}
@@ -219,30 +303,31 @@ read_file(const char *filePath, char **contents, long *fileSize)
 	*fileSize = ftell(fileStream);
 	if (*fileSize < 0)
 	{
-		log_error("Failed to read file \"%s\": %s", filePath, strerror(errno));
+		log_error("Failed to read file \"%s\": %m", filePath);
 		fclose(fileStream);
 		return false;
 	}
 
 	if (fseek(fileStream, 0, SEEK_SET) != 0)
 	{
-		log_error("Failed to read file \"%s\": %s", filePath, strerror(errno));
+		log_error("Failed to read file \"%s\": %m", filePath);
 		fclose(fileStream);
 		return false;
 	}
 
 	/* read the contents */
-	data = malloc(*fileSize + 1);
+	char *data = malloc(*fileSize + 1);
 	if (data == NULL)
 	{
 		log_error("Failed to allocate %ld bytes", *fileSize);
+		log_error(ALLOCATION_FAILED_ERROR);
 		fclose(fileStream);
 		return false;
 	}
 
 	if (fread(data, sizeof(char), *fileSize, fileStream) < *fileSize)
 	{
-		log_error("Failed to read file \"%s\": %s", filePath, strerror(errno));
+		log_error("Failed to read file \"%s\": %m", filePath);
 		fclose(fileStream);
 		free(data);
 		return false;
@@ -258,6 +343,155 @@ read_file(const char *filePath, char **contents, long *fileSize)
 	data[*fileSize] = '\0';
 	*contents = data;
 
+	return true;
+}
+
+
+/*
+ * move_file is a utility function to move a file from sourcePath to
+ * destinationPath. It behaves like mv system command. First attempts to move
+ * a file using rename. if it fails with EXDEV error, the function duplicates
+ * the source file with owner and permission information and removes it.
+ */
+bool
+move_file(char *sourcePath, char *destinationPath)
+{
+	if (strncmp(sourcePath, destinationPath, MAXPGPATH) == 0)
+	{
+		/* nothing to do */
+		log_warn("Source and destination are the same \"%s\", nothing to move.",
+				 sourcePath);
+		return true;
+	}
+
+	if (!file_exists(sourcePath))
+	{
+		log_error("Failed to move file, source file \"%s\" does not exist.",
+				  sourcePath);
+		return false;
+	}
+
+	if (file_exists(destinationPath))
+	{
+		log_error("Failed to move file, destination file \"%s\" already exists.",
+				  destinationPath);
+		return false;
+	}
+
+	/* first try atomic move operation */
+	if (rename(sourcePath, destinationPath) == 0)
+	{
+		return true;
+	}
+
+	/*
+	 * rename fails with errno = EXDEV when moving file to a different file
+	 * system.
+	 */
+	if (errno != EXDEV)
+	{
+		log_error("Failed to move file \"%s\" to \"%s\": %m",
+				  sourcePath, destinationPath);
+		return false;
+	}
+
+	if (!duplicate_file(sourcePath, destinationPath))
+	{
+		/* specific error is already logged */
+		log_error("Canceling file move due to errors.");
+		return false;
+	}
+
+	/* everything is successful we can remove the file */
+	unlink_file(sourcePath);
+
+	return true;
+}
+
+
+/*
+ * duplicate_file is a utility function to duplicate a file from sourcePath to
+ * destinationPath. It reads the contents of the source file and writes to the
+ * destination file. It expects non-existing destination file and does not
+ * copy over if it exists. The function returns true on successful execution.
+ *
+ * Note: the function reads the whole file into memory before copying out.
+ */
+bool
+duplicate_file(char *sourcePath, char *destinationPath)
+{
+	char *fileContents;
+	long fileSize;
+	struct stat sourceFileStat;
+
+	if (!read_file(sourcePath, &fileContents, &fileSize))
+	{
+		/* errors are logged */
+		return false;
+	}
+
+	if (file_exists(destinationPath))
+	{
+		log_error("Failed to duplicate, destination file already exists : %s",
+				  destinationPath);
+		return false;
+	}
+
+	bool foundError = !write_file(fileContents, fileSize, destinationPath);
+
+	free(fileContents);
+
+	if (foundError)
+	{
+		/* errors are logged in write_file */
+		return false;
+	}
+
+	/* set uid gid and mode */
+	if (stat(sourcePath, &sourceFileStat) != 0)
+	{
+		log_error("Failed to get ownership and file permissions on \"%s\"",
+				  sourcePath);
+		foundError = true;
+	}
+	else
+	{
+		if (chown(destinationPath, sourceFileStat.st_uid, sourceFileStat.st_gid) != 0)
+		{
+			log_error("Failed to set user and group id on \"%s\"",
+					  destinationPath);
+			foundError = true;
+		}
+		if (chmod(destinationPath, sourceFileStat.st_mode) != 0)
+		{
+			log_error("Failed to set file permissions on \"%s\"",
+					  destinationPath);
+			foundError = true;
+		}
+	}
+
+	if (foundError)
+	{
+		/* errors are already logged */
+		unlink_file(destinationPath);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * create_symbolic_link creates a symbolic link to source path.
+ */
+bool
+create_symbolic_link(char *sourcePath, char *targetPath)
+{
+	if (symlink(sourcePath, targetPath) != 0)
+	{
+		log_error("Failed to create symbolic link to \"%s\": %m", targetPath);
+		return false;
+	}
 	return true;
 }
 
@@ -287,53 +521,54 @@ path_in_same_directory(const char *basePath, const char *fileName,
 
 
 /*
- * Searches all the directories in the ':' separated pathlist for
- * the given filename. Returns number of occurrences, and allocates
- * and returns the path for each of the occurrences in the given result
- * pointer.
- *
- * If the result size is 0, then *result is set to NULL.
- *
- * The caller should free the result by calling search_pathlist_destroy_result().
+ * search_path_first copies the first entry found in PATH to result. result
+ * should be a buffer of (at least) MAXPGPATH size.
+ * The function returns false and logs an error when it cannot find the command
+ * in PATH.
  */
-int
-search_pathlist(const char *pathlist, const char *filename, char ***result)
+bool
+search_path_first(const char *filename, char *result, int logLevel)
 {
-	char *stringSpace = NULL;
-	char *path = NULL;
-	int pathListLength = 0;
-	int resultSize = 0;
-	int pathIndex = 0;
+	SearchPath paths = { 0 };
+
+	if (!search_path(filename, &paths) || paths.found == 0)
+	{
+		log_level(logLevel, "Failed to find %s command in your PATH", filename);
+		return false;
+	}
+
+	strlcpy(result, paths.matches[0], MAXPGPATH);
+
+	return true;
+}
+
+
+/*
+ * Searches all the directories in the PATH environment variable for the given
+ * filename. Returns number of occurrences and each match found with its
+ * fullname, including the given filename, in the given pre-allocated
+ * SearchPath result.
+ */
+bool
+search_path(const char *filename, SearchPath *result)
+{
+	char pathlist[MAXPATHSIZE] = { 0 };
+
+	/* we didn't count nor find anything yet */
+	result->found = 0;
 
 	/* Create a copy of pathlist, because we modify it here. */
-	char *pathlist_copy = strdup(pathlist);
-
-	for (pathIndex = 0; pathlist[pathIndex] != '\0'; pathIndex++)
+	if (!get_env_copy("PATH", pathlist, sizeof(pathlist)))
 	{
-		if (IS_PATH_VAR_SEP(pathlist[pathIndex]))
-		{
-			pathListLength++;
-		}
+		/* errors have already been logged */
+		return false;
 	}
 
-	if (pathListLength == 0)
-	{
-		*result = NULL;
-		free(pathlist_copy);
-		return 0;
-	}
-
-	/* allocate array of pointers */
-	*result = malloc(pathListLength * sizeof(char *));
-
-	/* allocate memory to store the strings */
-	stringSpace = malloc(pathListLength * MAXPGPATH);
-
-	path = pathlist_copy;
+	char *path = pathlist;
 
 	while (path != NULL)
 	{
-		char candidate[MAXPGPATH];
+		char candidate[MAXPGPATH] = { 0 };
 		char *sep = first_path_var_separator(path);
 
 		/* split path on current token, null-terminating string at separator */
@@ -342,59 +577,86 @@ search_pathlist(const char *pathlist, const char *filename, char ***result)
 			*sep = '\0';
 		}
 
-		join_path_components(candidate, path, filename);
-		canonicalize_path(candidate);
+		(void) join_path_components(candidate, path, filename);
+		(void) canonicalize_path(candidate);
 
 		if (file_exists(candidate))
 		{
-			char *destinationString = stringSpace + resultSize * MAXPGPATH;
-			bool duplicated = false;
-			strlcpy(destinationString, candidate, MAXPGPATH);
-
-			for (int i=0; i<resultSize; i++)
-			{
-				if (strcmp((*result)[i], destinationString) == 0)
-				{
-					duplicated = true;
-					break;
-				}
-			}
-
-			if (!duplicated)
-			{
-				(*result)[resultSize] = destinationString;
-				resultSize++;
-			}
+			strlcpy(result->matches[result->found++], candidate, MAXPGPATH);
 		}
 
 		path = (sep == NULL ? NULL : sep + 1);
 	}
 
-	if (resultSize == 0)
-	{
-		/* we won't return a string to the caller, free it now */
-		free(stringSpace);
-
-		free(*result);
-		*result = NULL;
-	}
-
-	free(pathlist_copy);
-
-	return resultSize;
+	return true;
 }
 
+
 /*
- * Frees the space allocated by search_pathlist().
+ * search_path_deduplicate_symlinks traverse the SearchPath result obtained by
+ * calling the search_path() function and removes entries that are pointing to
+ * the same binary on-disk.
+ *
+ * In modern debian installations, for instance, we have /bin -> /usr/bin; and
+ * then we might find pg_config both in /bin/pg_config and /usr/bin/pg_config
+ * although it's only been installed once, and both are the same file.
+ *
+ * We use realpath() to deduplicate entries, and keep the entry that is not a
+ * symbolic link.
  */
-void
-search_pathlist_destroy_result(char **result)
+bool
+search_path_deduplicate_symlinks(SearchPath *results, SearchPath *dedup)
 {
-	if (result != NULL)
+	/* now re-initialize the target structure dedup */
+	dedup->found = 0;
+
+	for (int rIndex = 0; rIndex < results->found; rIndex++)
 	{
-		free(result[0]);
+		bool alreadyThere = false;
+
+		char *currentPath = results->matches[rIndex];
+		char currentRealPath[PATH_MAX] = { 0 };
+
+		if (realpath(currentPath, currentRealPath) == NULL)
+		{
+			log_error("Failed to normalize file name \"%s\": %m", currentPath);
+			return false;
+		}
+
+		/* add-in the realpath to dedup, unless it's already in there */
+		for (int dIndex = 0; dIndex < dedup->found; dIndex++)
+		{
+			if (strcmp(dedup->matches[dIndex], currentRealPath) == 0)
+			{
+				alreadyThere = true;
+
+				log_debug("dedup: skipping \"%s\"", currentPath);
+				break;
+			}
+		}
+
+		if (!alreadyThere)
+		{
+			int bytesWritten =
+				strlcpy(dedup->matches[dedup->found++],
+						currentRealPath,
+						MAXPGPATH);
+
+			if (bytesWritten >= MAXPGPATH)
+			{
+				log_error(
+					"Real path \"%s\" is %d bytes long, and pg_autoctl "
+					"is limited to handling paths of %d bytes long, maximum",
+					currentRealPath,
+					(int) strlen(currentRealPath),
+					MAXPGPATH);
+
+				return false;
+			}
+		}
 	}
-	free(result);
+
+	return true;
 }
 
 
@@ -410,7 +672,7 @@ unlink_file(const char *filename)
 		/* if it didn't exist yet, good news! */
 		if (errno != ENOENT && errno != ENOTDIR)
 		{
-			log_error("Failed to remove stale state file at \"%s\"", filename);
+			log_error("Failed to remove file \"%s\": %m", filename);
 			return false;
 		}
 	}
@@ -426,7 +688,7 @@ unlink_file(const char *filename)
  * then argv[0] (here pg_autoctl_argv0) is just "pg_autoctl".
  */
 bool
-get_program_absolute_path(char *program, int size)
+set_program_absolute_path(char *program, int size)
 {
 #if defined(__APPLE__)
 	int actualSize = _NSGetExecutablePath(program, (uint32_t *) &size);
@@ -438,7 +700,11 @@ get_program_absolute_path(char *program, int size)
 				  "to %d bytes only", actualSize, size);
 		return false;
 	}
+
+	log_debug("Found absolute program: \"%s\"", program);
+
 #else
+
 	/*
 	 * On Linux and FreeBSD and Solaris, we can find a symbolic link to our
 	 * program and get the information with readlink. Of course the /proc entry
@@ -446,9 +712,9 @@ get_program_absolute_path(char *program, int size)
 	 */
 	bool found = false;
 	char *procEntryCandidates[] = {
-		"/proc/self/exe",		/* Linux */
-		"/proc/curproc/file",	/* FreeBSD */
-		"/proc/self/path/a.out"	/* Solaris */
+		"/proc/self/exe",       /* Linux */
+		"/proc/curproc/file",   /* FreeBSD */
+		"/proc/self/path/a.out" /* Solaris */
 	};
 	int procEntrySize = sizeof(procEntryCandidates) / sizeof(char *);
 	int procEntryIndex = 0;
@@ -468,7 +734,7 @@ get_program_absolute_path(char *program, int size)
 			if (errno != ENOENT && errno != ENOTDIR)
 			{
 				log_error("Failed to get absolute path for the "
-						  "pg_autoctl program: %s", strerror(errno));
+						  "pg_autoctl program: %m");
 				return false;
 			}
 		}
@@ -484,8 +750,7 @@ get_program_absolute_path(char *program, int size)
 		 * Now either return pg_autoctl_argv0 when that's an absolute filename,
 		 * or search for it in the PATH otherwise.
 		 */
-		char **pathEntries = NULL;
-		int n;
+		SearchPath paths = { 0 };
 
 		if (pg_autoctl_argv0[0] == '/')
 		{
@@ -493,9 +758,7 @@ get_program_absolute_path(char *program, int size)
 			return true;
 		}
 
-		n = search_pathlist(getenv("PATH"), pg_autoctl_argv0, &pathEntries);
-
-		if (n < 1)
+		if (!search_path(pg_autoctl_argv0, &paths) || paths.found == 0)
 		{
 			log_error("Failed to find \"%s\" in PATH environment",
 					  pg_autoctl_argv0);
@@ -504,9 +767,8 @@ get_program_absolute_path(char *program, int size)
 		else
 		{
 			log_debug("Found \"%s\" in PATH at \"%s\"",
-					  pg_autoctl_argv0, pathEntries[0]);
-			strlcpy(program, pathEntries[0], size);
-			search_pathlist_destroy_result(pathEntries);
+					  pg_autoctl_argv0, paths.matches[0]);
+			strlcpy(program, paths.matches[0], size);
 
 			return true;
 		}
@@ -514,4 +776,167 @@ get_program_absolute_path(char *program, int size)
 #endif
 
 	return true;
+}
+
+
+/*
+ * normalize_filename returns the real path of a given filename that belongs to
+ * an existing file on-disk, resolving symlinks and pruning double-slashes and
+ * other weird constructs. filename and dst are allowed to point to the same
+ * adress.
+ */
+bool
+normalize_filename(const char *filename, char *dst, int size)
+{
+	/* normalize the path to the configuration file, if it exists */
+	if (file_exists(filename))
+	{
+		char realPath[PATH_MAX] = { 0 };
+
+		if (realpath(filename, realPath) == NULL)
+		{
+			log_fatal("Failed to normalize file name \"%s\": %m", filename);
+			return false;
+		}
+
+		if (strlcpy(dst, realPath, size) >= size)
+		{
+			log_fatal("Real path \"%s\" is %d bytes long, and pg_autoctl "
+					  "is limited to handling paths of %d bytes long, maximum",
+					  realPath, (int) strlen(realPath), size);
+			return false;
+		}
+	}
+	else
+	{
+		char realPath[PATH_MAX] = { 0 };
+
+		/* protect against undefined behavior if dst overlaps with filename */
+		strlcpy(realPath, filename, MAXPGPATH);
+		strlcpy(dst, realPath, MAXPGPATH);
+	}
+
+	return true;
+}
+
+
+/*
+ * fformat is a secured down version of pg_fprintf:
+ *
+ * Additional security checks are:
+ *  - make sure stream is not null
+ *  - make sure fmt is not null
+ *  - rely on pg_fprintf Assert() that %s arguments are not null
+ */
+int
+fformat(FILE *stream, const char *fmt, ...)
+{
+	va_list args;
+
+	if (stream == NULL || fmt == NULL)
+	{
+		log_error("BUG: fformat is called with a NULL target or format string");
+		return -1;
+	}
+
+	va_start(args, fmt);
+	int len = pg_vfprintf(stream, fmt, args);
+	va_end(args);
+	return len;
+}
+
+
+/*
+ * sformat is a secured down version of pg_snprintf
+ */
+int
+sformat(char *str, size_t count, const char *fmt, ...)
+{
+	va_list args;
+
+	if (str == NULL || fmt == NULL)
+	{
+		log_error("BUG: sformat is called with a NULL target or format string");
+		return -1;
+	}
+
+	va_start(args, fmt);
+	int len = pg_vsnprintf(str, count, fmt, args);
+	va_end(args);
+
+	if (len >= count)
+	{
+		log_error("BUG: sformat needs %d bytes to expend format string \"%s\", "
+				  "and a target string of %lu bytes only has been given.",
+				  len, fmt, count);
+	}
+
+	return len;
+}
+
+
+/*
+ * set_ps_title sets the process title seen in ps/top and friends, truncating
+ * if there is not enough space, rather than causing memory corruption.
+ *
+ * Inspired / stolen from Postgres code src/backend/utils/misc/ps_status.c with
+ * most of the portability bits removed. At the moment we prefer simple code
+ * that works on few targets to highly portable code.
+ */
+void
+init_ps_buffer(int argc, char **argv)
+{
+#if defined(__linux__) || defined(__darwin__)
+	char *end_of_area = NULL;
+	int i;
+
+	/*
+	 * check for contiguous argv strings
+	 */
+	for (i = 0; i < argc; i++)
+	{
+		if (i == 0 || end_of_area + 1 == argv[i])
+		{
+			end_of_area = argv[i] + strlen(argv[i]); /* lgtm[cpp/tainted-arithmetic] */
+		}
+	}
+
+	if (end_of_area == NULL)    /* probably can't happen? */
+	{
+		ps_buffer = NULL;
+		ps_buffer_size = 0;
+		return;
+	}
+
+	ps_buffer = argv[0];
+	last_status_len = ps_buffer_size = end_of_area - argv[0]; /* lgtm[cpp/tainted-arithmetic] */
+
+#else
+	ps_buffer = NULL;
+	ps_buffer_size = 0;
+
+	return;
+#endif
+}
+
+
+/*
+ * set_ps_title sets our process name visible in ps/top/pstree etc.
+ */
+void
+set_ps_title(const char *title)
+{
+	if (ps_buffer == NULL)
+	{
+		/* noop */
+		return;
+	}
+
+	int n = sformat(ps_buffer, ps_buffer_size, "%s", title);
+
+	/* pad our process title string */
+	for (size_t i = n; i < ps_buffer_size; i++)
+	{
+		*(ps_buffer + i) = '\0';
+	}
 }

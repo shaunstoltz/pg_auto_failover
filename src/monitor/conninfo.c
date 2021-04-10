@@ -37,21 +37,20 @@ static char * ReadPrimaryConnInfoFromRecoveryConf(void);
 int
 ReadPrimaryHostAddress(char **primaryName, char **primaryPort)
 {
-	char *connInfo = NULL;
 	char *errorMessage = NULL;
-	PQconninfoOption *options = NULL;
 	PQconninfoOption *currentOption = NULL;
 
-	connInfo = ReadPrimaryConnInfoFromRecoveryConf();
+	char *connInfo = ReadPrimaryConnInfoFromRecoveryConf();
 	if (connInfo == NULL)
 	{
 		return -1;
 	}
 
-	options = PQconninfoParse(connInfo, &errorMessage);
+	PQconninfoOption *options = PQconninfoParse(connInfo, &errorMessage);
 	if (options == NULL)
 	{
-		free(connInfo);
+		pfree(connInfo);
+		return -1;
 	}
 
 	for (currentOption = options; currentOption->keyword != NULL; currentOption++)
@@ -89,13 +88,12 @@ ReadPrimaryHostAddress(char **primaryName, char **primaryPort)
 static char *
 ReadPrimaryConnInfoFromRecoveryConf(void)
 {
-	FILE *fd = NULL;
 	ConfigVariable *item = NULL;
 	ConfigVariable *head = NULL;
 	ConfigVariable *tail = NULL;
 	char *primaryConnInfo = NULL;
 
-	fd = AllocateFile(RECOVERY_COMMAND_FILE, "r");
+	FILE *fd = AllocateFile(RECOVERY_COMMAND_FILE, "r");
 	if (fd == NULL)
 	{
 		ereport(LOG, (errcode_for_file_access(),

@@ -1,0 +1,69 @@
+% Fix for: https://tex.stackexchange.com/a/315027/43228
+\RequirePackage{luatex85}
+\documentclass[border=10pt,17pt]{standalone}
+
+\usepackage{cfr-lm}
+\usepackage{pgf}
+\usepackage{tikz}
+\usetikzlibrary{arrows,shapes,snakes}
+\usetikzlibrary{shapes.multipart}
+
+\begin{document}
+
+%% sans-serif fonts, large by default, and bold too
+\sffamily
+\sbweight
+\bfseries
+\large
+
+\begin{tikzpicture}[>=stealth',auto,rounded corners]
+
+  \input{common.tex}
+
+  %% \draw [help lines] (-10,0) grid (10,20);
+
+  \node (flegend) at (0,18) {\textt{number\_sync\_standby = 1}} ;
+
+  \node  (a)   at (0,15)   [primary]
+         {\textbf{\normalsize Node A}
+           \nodepart{second}
+           \textbf{\Large Primary}
+           \nodepart[text=stxt]{third}
+		   \texttt{replication quorum = true} \\
+		   \texttt{candidate priority = 50}
+         };
+
+  \node  (b)   at (-6,8)  [standby]
+         {\textbf{\normalsize Node B}
+           \nodepart{second}
+           \textbf{\Large Secondary}
+           \nodepart{third}
+		   \texttt{replication quorum = true} \\
+		   \texttt{candidate priority = 50}
+         };
+
+  \node  (c)   at (6,8)   [standby]
+         {\textbf{\normalsize Node C}
+           \nodepart{second}
+           \textbf{\Large Secondary}
+           \nodepart{third}
+		   \texttt{replication quorum = true} \\
+		   \texttt{candidate priority = 50}
+         };
+
+  \node  (app) at (-8,18)  [app]        {\textbf{\Large Application}};
+  \node  (m)   at (8,18)   [monitor]    {\textbf{\Large Monitor}};
+
+  \path (app) edge [sql]  node[near start]       {SQL}            (a)
+              edge [sqlf] node[left,near start]  {SQL (fallback)} (b)
+              edge [sqlf,out=-90,in=145]                          (c)
+
+        (a)   edge [sr]  node[left]           {Streaming}   (b.north east)
+              edge [sr]  node[right]  {Replication} (c.north west)
+
+        (m)   edge [hc]                                               (a)
+              edge [hc,out=-90,in=35]                                 (b)
+              edge [hc] node[right,near start] {Health checks}        (c);
+\end{tikzpicture}
+
+\end{document}

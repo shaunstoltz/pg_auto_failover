@@ -15,6 +15,7 @@
 
 #include "health_check.h"
 #include "metadata.h"
+#include "notifications.h"
 
 #include "access/htup.h"
 #include "access/tupdesc.h"
@@ -30,9 +31,10 @@
 
 
 /* human-readable names for addressing columns of health check queries */
-#define TLIST_NUM_NODE_NAME 1
-#define TLIST_NUM_NODE_PORT 2
-#define TLIST_NUM_HEALTH_STATUS 3
+#define TLIST_NUM_NODE_ID 1
+#define TLIST_NUM_NODE_HOST 2
+#define TLIST_NUM_NODE_PORT 3
+#define TLIST_NUM_HEALTH_STATUS 4
 
 
 /* GUCs */
@@ -67,20 +69,31 @@ LoadNodeHealthList(void)
 	{
 		initStringInfo(&query);
 		appendStringInfo(&query,
-						 "SELECT nodename, nodeport, health "
+						 "SELECT nodeid, nodehost, nodeport, health "
 						 "FROM " AUTO_FAILOVER_NODE_TABLE);
 
 		pgstat_report_activity(STATE_RUNNING, query.data);
 
 		spiStatus = SPI_execute(query.data, false, 0);
-		Assert(spiStatus == SPI_OK_SELECT);
+
+		/*
+		 * When we start the monitor during an upgrade (from 1.3 to 1.4), the
+		 * background worker might be reading the 1.3 pgautofailover catalogs
+		 * still, where the "nodehost" column does not exists.
+		 */
+		if (spiStatus != SPI_OK_SELECT)
+		{
+			EndSPITransaction();
+			return NIL;
+		}
 
 		oldContext = MemoryContextSwitchTo(upperContext);
 
-		for (uint32 rowNumber = 0; rowNumber < SPI_processed; rowNumber++)
+		for (uint64 rowNumber = 0; rowNumber < SPI_processed; rowNumber++)
 		{
 			HeapTuple heapTuple = SPI_tuptable->vals[rowNumber];
-			NodeHealth *nodeHealth = TupleToNodeHealth(heapTuple, SPI_tuptable->tupdesc);
+			NodeHealth *nodeHealth =
+				TupleToNodeHealth(heapTuple, SPI_tuptable->tupdesc);
 			nodeHealthList = lappend(nodeHealthList, nodeHealth);
 		}
 
@@ -103,7 +116,6 @@ LoadNodeHealthList(void)
 static bool
 HaMonitorHasBeenLoaded(void)
 {
-	bool extensionLoaded = false;
 	bool extensionPresent = false;
 	bool extensionScriptExecuted = true;
 
@@ -126,7 +138,7 @@ HaMonitorHasBeenLoaded(void)
 		}
 	}
 
-	extensionLoaded = extensionPresent && extensionScriptExecuted;
+	bool extensionLoaded = extensionPresent && extensionScriptExecuted;
 
 	return extensionLoaded;
 }
@@ -139,18 +151,20 @@ HaMonitorHasBeenLoaded(void)
 NodeHealth *
 TupleToNodeHealth(HeapTuple heapTuple, TupleDesc tupleDescriptor)
 {
-	NodeHealth *nodeHealth = NULL;
 	bool isNull = false;
 
-	Datum nodeNameDatum = SPI_getbinval(heapTuple, tupleDescriptor,
-										TLIST_NUM_NODE_NAME, &isNull);
+	Datum nodeIdDatum = SPI_getbinval(heapTuple, tupleDescriptor,
+									  TLIST_NUM_NODE_ID, &isNull);
+	Datum nodeHostDatum = SPI_getbinval(heapTuple, tupleDescriptor,
+										TLIST_NUM_NODE_HOST, &isNull);
 	Datum nodePortDatum = SPI_getbinval(heapTuple, tupleDescriptor,
 										TLIST_NUM_NODE_PORT, &isNull);
 	Datum healthStateDatum = SPI_getbinval(heapTuple, tupleDescriptor,
 										   TLIST_NUM_HEALTH_STATUS, &isNull);
 
-	nodeHealth = palloc0(sizeof(NodeHealth));
-	nodeHealth->nodeName = TextDatumGetCString(nodeNameDatum);
+	NodeHealth *nodeHealth = palloc0(sizeof(NodeHealth));
+	nodeHealth->nodeId = DatumGetInt32(nodeIdDatum);
+	nodeHealth->nodeHost = TextDatumGetCString(nodeHostDatum);
 	nodeHealth->nodePort = DatumGetInt32(nodePortDatum);
 	nodeHealth->healthState = DatumGetInt32(healthStateDatum);
 
@@ -162,7 +176,9 @@ TupleToNodeHealth(HeapTuple heapTuple, TupleDesc tupleDescriptor)
  * SetNodeHealthState updates the health state of a node in the metadata.
  */
 void
-SetNodeHealthState(char *nodeName, uint16 nodePort, int healthState)
+SetNodeHealthState(int nodeId, char *nodeHost, uint16 nodePort,
+				   int previousHealthState,
+				   int healthState)
 {
 	StringInfoData query;
 	int spiStatus PG_USED_FOR_ASSERTS_ONLY = 0;
@@ -176,15 +192,27 @@ SetNodeHealthState(char *nodeName, uint16 nodePort, int healthState)
 		appendStringInfo(&query,
 						 "UPDATE " AUTO_FAILOVER_NODE_TABLE
 						 "   SET health = %d, healthchecktime = now() "
-						 " WHERE nodename = %s AND nodeport = %d",
+						 " WHERE nodehost = %s AND nodeport = %d",
 						 healthState,
-						 quote_literal_cstr(nodeName),
+						 quote_literal_cstr(nodeHost),
 						 nodePort);
 
 		pgstat_report_activity(STATE_RUNNING, query.data);
 
 		spiStatus = SPI_execute(query.data, false, 0);
 		Assert(spiStatus == SPI_OK_UPDATE);
+
+		if (healthState != previousHealthState)
+		{
+			char message[BUFSIZE] = { 0 };
+
+			LogAndNotifyMessage(message, sizeof(message),
+								"Node %d (%s:%d) is marked as %s by the monitor",
+								nodeId,
+								nodeHost,
+								nodePort,
+								healthState == 0 ? "unhealthy" : "healthy");
+		}
 	}
 	else
 	{
@@ -220,4 +248,38 @@ EndSPITransaction(void)
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
+}
+
+
+/*
+ * NodeHealthToString returns a string representation of the given node health
+ * enum value.
+ */
+char *
+NodeHealthToString(NodeHealthState health)
+{
+	switch (health)
+	{
+		case NODE_HEALTH_UNKNOWN:
+		{
+			return "unknown";
+		}
+
+		case NODE_HEALTH_BAD:
+		{
+			return "bad";
+		}
+
+		case NODE_HEALTH_GOOD:
+		{
+			return "good";
+		}
+
+		default:
+		{
+			/* shouldn't happen */
+			ereport(ERROR, (errmsg("BUG: health is %d", health)));
+			return "unknown";
+		}
+	}
 }

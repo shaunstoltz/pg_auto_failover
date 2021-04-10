@@ -16,6 +16,7 @@
 
 #include "metadata.h"
 #include "replication_state.h"
+#include "version_compat.h"
 
 #include "access/htup.h"
 #include "access/htup_details.h"
@@ -54,21 +55,16 @@ ReplicationStateTypeOid(void)
 ReplicationState
 EnumGetReplicationState(Oid replicationStateOid)
 {
-	HeapTuple enumTuple = NULL;
-	Form_pg_enum enumForm = NULL;
-	char *enumName = NULL;
-	ReplicationState replicationState = REPLICATION_STATE_UNKNOWN;
-
-	enumTuple = SearchSysCache1(ENUMOID, ObjectIdGetDatum(replicationStateOid));
+	HeapTuple enumTuple = SearchSysCache1(ENUMOID, ObjectIdGetDatum(replicationStateOid));
 	if (!HeapTupleIsValid(enumTuple))
 	{
 		ereport(ERROR, (errmsg("invalid input value for enum: %u",
 							   replicationStateOid)));
 	}
 
-	enumForm = (Form_pg_enum) GETSTRUCT(enumTuple);
-	enumName = NameStr(enumForm->enumlabel);
-	replicationState = NameGetReplicationState(enumName);
+	Form_pg_enum enumForm = (Form_pg_enum) GETSTRUCT(enumTuple);
+	char *enumName = NameStr(enumForm->enumlabel);
+	ReplicationState replicationState = NameGetReplicationState(enumName);
 
 	ReleaseSysCache(enumTuple);
 
@@ -83,21 +79,19 @@ EnumGetReplicationState(Oid replicationStateOid)
 Oid
 ReplicationStateGetEnum(ReplicationState replicationState)
 {
-	Oid replicationStateOid = InvalidOid;
 	const char *enumName = ReplicationStateGetName(replicationState);
-	HeapTuple enumTuple = NULL;
 	Oid enumTypeOid = ReplicationStateTypeOid();
 
-	enumTuple = SearchSysCache2(ENUMTYPOIDNAME,
-								ObjectIdGetDatum(enumTypeOid),
-								CStringGetDatum(enumName));
+	HeapTuple enumTuple = SearchSysCache2(ENUMTYPOIDNAME,
+										  ObjectIdGetDatum(enumTypeOid),
+										  CStringGetDatum(enumName));
 	if (!HeapTupleIsValid(enumTuple))
 	{
 		ereport(ERROR, (errmsg("invalid value for enum: %d",
 							   replicationState)));
 	}
 
-	replicationStateOid = HeapTupleGetOid(enumTuple);
+	Oid replicationStateOid = HeapTupleGetOid(enumTuple);
 
 	ReleaseSysCache(enumTuple);
 
@@ -215,9 +209,46 @@ ReplicationStateGetName(ReplicationState replicationState)
 			return "maintenance";
 		}
 
+		case REPLICATION_STATE_JOIN_PRIMARY:
+		{
+			return "join_primary";
+		}
+
+		case REPLICATION_STATE_APPLY_SETTINGS:
+		{
+			return "apply_settings";
+		}
+
+		case REPLICATION_STATE_PREPARE_MAINTENANCE:
+		{
+			return "prepare_maintenance";
+		}
+
+		case REPLICATION_STATE_WAIT_MAINTENANCE:
+		{
+			return "wait_maintenance";
+		}
+
+		case REPLICATION_STATE_REPORT_LSN:
+		{
+			return "report_lsn";
+		}
+
+		case REPLICATION_STATE_FAST_FORWARD:
+		{
+			return "fast_forward";
+		}
+
+		case REPLICATION_STATE_JOIN_SECONDARY:
+		{
+			return "join_secondary";
+		}
+
 		default:
 		{
-			ereport(ERROR, (errmsg("bug: unknown replication state")));
+			ereport(ERROR,
+					(errmsg("bug: unknown replication state (%d)",
+							replicationState)));
 		}
 	}
 }

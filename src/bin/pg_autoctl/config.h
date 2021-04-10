@@ -35,9 +35,10 @@ typedef struct ConfigFilePaths
 {
 	char config[MAXPGPATH]; /* ~/.config/pg_autoctl/${PGDATA}/pg_autoctl.cfg */
 	char state[MAXPGPATH];  /* ~/.local/share/pg_autoctl/${PGDATA}/pg_autoctl.state */
-	char pid[MAXPGPATH];	/* /tmp/${PGDATA}/pg_autoctl.pid */
-	char init[MAXPGPATH];	/* /tmp/${PGDATA}/pg_autoctl.init */
-	char systemd[MAXPGPATH];	/* ~/.config/systemd/user/pgautofailover.service */
+	char pid[MAXPGPATH];    /* /tmp/${PGDATA}/pg_autoctl.pid */
+	char init[MAXPGPATH];   /* /tmp/${PGDATA}/pg_autoctl.init */
+	char nodes[MAXPGPATH];  /* ~/.local/share/pg_autoctl/${PGDATA}/nodes.json */
+	char systemd[MAXPGPATH];    /* ~/.config/systemd/user/pgautofailover.service */
 } ConfigFilePaths;
 
 /*
@@ -65,13 +66,20 @@ typedef enum
 
 
 bool build_xdg_path(char *dst, XDGResourceType xdgType,
-						   const char *pgdata, const char *name);
-bool normalize_filename(const char *filename, char *dst, int size);
+					const char *pgdata, const char *name);
 
 bool SetConfigFilePath(ConfigFilePaths *pathnames, const char *pgdata);
 bool SetStateFilePath(ConfigFilePaths *pathnames, const char *pgdata);
+bool SetNodesFilePath(ConfigFilePaths *pathnames, const char *pgdata);
 bool SetPidFilePath(ConfigFilePaths *pathnames, const char *pgdata);
 
 pgAutoCtlNodeRole ProbeConfigurationFileRole(const char *filename);
+
+
+#define strneq(x, y) \
+	((x != NULL) && (y != NULL) && (strcmp(x, y) != 0))
+
+bool config_accept_new_ssloptions(PostgresSetup *pgSetup,
+								  PostgresSetup *newPgSetup);
 
 #endif /* CONFIG_H */

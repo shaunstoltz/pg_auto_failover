@@ -10,13 +10,13 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
+#include "ini.h"
 #include "ini_file.h"
 #include "log.h"
 #include "pgctl.h"
+#include "parson.h"
 #include "pgsetup.h"
-
-#define INI_IMPLEMENTATION
-#include "ini.h"
+#include "string_utils.h"
 
 /*
  * Load a configuration file in the INI format.
@@ -24,7 +24,6 @@
 bool
 read_ini_file(const char *filename, IniOption *optionList)
 {
-	ini_t *ini = NULL;
 	char *fileContents = NULL;
 	long fileSize = 0L;
 	IniOption *option;
@@ -36,7 +35,7 @@ read_ini_file(const char *filename, IniOption *optionList)
 	}
 
 	/* parse the content of the file as per INI syntax rules */
-	ini = ini_load(fileContents, NULL);
+	ini_t *ini = ini_load(fileContents, NULL);
 	free(fileContents);
 
 	/*
@@ -45,22 +44,33 @@ read_ini_file(const char *filename, IniOption *optionList)
 	 */
 	for (option = optionList; option->type != INI_END_T; option++)
 	{
-		int sectionIndex;
 		int optionIndex;
 		char *val;
 
-		sectionIndex = ini_find_section(ini, option->section, 0);
+		int sectionIndex = ini_find_section(ini, option->section, 0);
 
 		if (sectionIndex == INI_NOT_FOUND)
 		{
-			log_error("Failed to find section %s in \"%s\"",
-					  option->section, filename);
-			ini_destroy(ini);
-			return false;
+			if (option->required)
+			{
+				log_error("Failed to find section %s in \"%s\"",
+						  option->section, filename);
+				ini_destroy(ini);
+				return false;
+			}
+			optionIndex = INI_NOT_FOUND;
+		}
+		else
+		{
+			optionIndex = ini_find_property(ini, sectionIndex, option->name, 0);
 		}
 
-		optionIndex = ini_find_property(ini, sectionIndex, option->name, 0);
-
+		/*
+		 * When we didn't find an option, we have three cases to consider:
+		 *  1. it's required, error out
+		 *  2. it's a compatibility option, skip it
+		 *  3. use the default value instead
+		 */
 		if (optionIndex == INI_NOT_FOUND)
 		{
 			if (option->required)
@@ -69,6 +79,11 @@ read_ini_file(const char *filename, IniOption *optionList)
 						  option->section, option->name, filename);
 				ini_destroy(ini);
 				return false;
+			}
+			else if (option->compat)
+			{
+				/* skip compatibility options that are not found */
+				continue;
 			}
 			else
 			{
@@ -130,14 +145,13 @@ ini_validate_options(IniOption *optionList)
 
 	for (option = optionList; option->type != INI_END_T; option++)
 	{
-		int n;
 		char optionName[BUFSIZE];
 
-		n = sprintf(optionName, "%s.%s", option->section, option->name);
+		int n = sformat(optionName, BUFSIZE, "%s.%s", option->section, option->name);
 
 		if (option->optName)
 		{
-			sprintf(optionName + n, " (--%s)", option->optName);
+			sformat(optionName + n, BUFSIZE - n, " (--%s)", option->optName);
 		}
 
 		switch (option->type)
@@ -209,6 +223,11 @@ ini_validate_options(IniOption *optionList)
 bool
 ini_set_option_value(IniOption *option, const char *value)
 {
+	if (option == NULL)
+	{
+		return false;
+	}
+
 	switch (option->type)
 	{
 		case INI_STRING_T:
@@ -246,9 +265,9 @@ ini_set_option_value(IniOption *option, const char *value)
 		{
 			if (value)
 			{
-				int nb = strtol(value, NULL, 10);
+				int nb;
 
-				if (nb == 0 && errno == EINVAL)
+				if (!stringToInt(value, &nb))
 				{
 					log_error("Failed to parse %s.%s's value \"%s\" as a number",
 							  option->section, option->name, value);
@@ -280,6 +299,12 @@ ini_option_to_string(IniOption *option, char *dest, size_t size)
 	{
 		case INI_STRING_T:
 		{
+			/* option->strValue is a char **, both pointers could be NULL */
+			if (option->strValue == NULL || *(option->strValue) == NULL)
+			{
+				return false;
+			}
+
 			strlcpy(dest, *(option->strValue), size);
 			return true;
 		}
@@ -292,7 +317,7 @@ ini_option_to_string(IniOption *option, char *dest, size_t size)
 
 		case INI_INT_T:
 		{
-			snprintf(dest, size, "%d", *(option->intValue));
+			sformat(dest, size, "%d", *(option->intValue));
 			return true;
 		}
 
@@ -321,22 +346,29 @@ write_ini_to_stream(FILE *stream, IniOption *optionList)
 
 	for (option = optionList; option->type != INI_END_T; option++)
 	{
+		/* we read "compatibility" options but never write them back */
+		if (option->compat)
+		{
+			continue;
+		}
+
 		/* we might need to open a new section */
 		if (!streq(currentSection, option->section))
 		{
 			if (currentSection != NULL)
 			{
-				fprintf(stream, "\n");
+				fformat(stream, "\n");
 			}
 			currentSection = (char *) option->section;
-			fprintf(stream, "[%s]\n", currentSection);
+			fformat(stream, "[%s]\n", currentSection);
 		}
 
 		switch (option->type)
 		{
 			case INI_INT_T:
 			{
-				fprintf(stream, "%s = %d\n", option->name, *(option->intValue));
+				fformat(stream, "%s = %d\n",
+						option->name, *(option->intValue));
 				break;
 			}
 
@@ -346,7 +378,7 @@ write_ini_to_stream(FILE *stream, IniOption *optionList)
 
 				if (value)
 				{
-					fprintf(stream, "%s = %s\n", option->name, value);
+					fformat(stream, "%s = %s\n", option->name, value);
 				}
 				else if (option->required)
 				{
@@ -364,7 +396,7 @@ write_ini_to_stream(FILE *stream, IniOption *optionList)
 
 				if (value[0] != '\0')
 				{
-					fprintf(stream, "%s = %s\n", option->name, value);
+					fformat(stream, "%s = %s\n", option->name, value);
 				}
 				else if (option->required)
 				{
@@ -384,6 +416,107 @@ write_ini_to_stream(FILE *stream, IniOption *optionList)
 		}
 	}
 	fflush(stream);
+	return true;
+}
+
+
+/*
+ * ini_to_json populates the given JSON value with the contents of the INI
+ * file. Sections become JSON objects, options the keys to the section objects.
+ */
+bool
+ini_to_json(JSON_Object *jsRoot, IniOption *optionList)
+{
+	char *currentSection = NULL;
+	JSON_Value *currentSectionJs = NULL;
+	JSON_Object *currentSectionJsObj = NULL;
+	IniOption *option = NULL;
+
+	for (option = optionList; option->type != INI_END_T; option++)
+	{
+		/* we read "compatibility" options but never write them back */
+		if (option->compat)
+		{
+			continue;
+		}
+
+		/* we might need to open a new section */
+		if (!streq(currentSection, option->section))
+		{
+			if (currentSection != NULL)
+			{
+				json_object_set_value(jsRoot, currentSection, currentSectionJs);
+			}
+
+			currentSectionJs = json_value_init_object();
+			currentSectionJsObj = json_value_get_object(currentSectionJs);
+
+			currentSection = (char *) option->section;
+		}
+
+		switch (option->type)
+		{
+			case INI_INT_T:
+			{
+				json_object_set_number(currentSectionJsObj,
+									   option->name,
+									   (double) *(option->intValue));
+				break;
+			}
+
+			case INI_STRING_T:
+			{
+				char *value = *(option->strValue);
+
+				if (value)
+				{
+					json_object_set_string(currentSectionJsObj,
+										   option->name,
+										   value);
+				}
+				else if (option->required)
+				{
+					log_error("Option %s.%s is required but is not set",
+							  option->section, option->name);
+					return false;
+				}
+				break;
+			}
+
+			case INI_STRBUF_T:
+			{
+				/* here we have a string buffer, which is its own address */
+				char *value = (char *) option->strBufValue;
+
+				if (value[0] != '\0')
+				{
+					json_object_set_string(currentSectionJsObj,
+										   option->name,
+										   value);
+				}
+				else if (option->required)
+				{
+					log_error("Option %s.%s is required but is not set",
+							  option->section, option->name);
+					return false;
+				}
+				break;
+			}
+
+			default:
+			{
+				/* developper error, should never happen */
+				log_fatal("Unknown option type %d", option->type);
+				break;
+			}
+		}
+	}
+
+	if (currentSection != NULL)
+	{
+		json_object_set_value(jsRoot, currentSection, currentSectionJs);
+	}
+
 	return true;
 }
 
@@ -416,7 +549,6 @@ IniOption *
 lookup_ini_path_value(IniOption *optionList, const char *path)
 {
 	char *section_name, *option_name, *ptr;
-	IniOption *option;
 
 	/*
 	 * Split path into section/option.
@@ -433,7 +565,7 @@ lookup_ini_path_value(IniOption *optionList, const char *path)
 	option_name = section_name + (ptr - path) + 1; /* apply same offset */
 	*(option_name - 1) = '\0';                     /* split string at the dot */
 
-	option = lookup_ini_option(optionList, section_name, option_name);
+	IniOption *option = lookup_ini_option(optionList, section_name, option_name);
 
 	if (option == NULL)
 	{
@@ -520,9 +652,7 @@ bool
 ini_get_setting(const char *filename, IniOption *optionList,
 				const char *path, char *value, size_t size)
 {
-	IniOption *option = NULL;
-
-	log_debug("Reading configuration from %s", filename);
+	log_debug("Reading configuration from \"%s\"", filename);
 
 	if (!read_ini_file(filename, optionList))
 	{
@@ -530,11 +660,31 @@ ini_get_setting(const char *filename, IniOption *optionList,
 		return false;
 	}
 
-	option = lookup_ini_path_value(optionList, path);
+	IniOption *option = lookup_ini_path_value(optionList, path);
 
 	if (option)
 	{
 		return ini_option_to_string(option, value, size);
+	}
+
+	return false;
+}
+
+
+/*
+ * ini_set_option sets the INI value to the given value.
+ */
+bool
+ini_set_option(IniOption *optionList, const char *path, char *value)
+{
+	IniOption *option = lookup_ini_path_value(optionList, path);
+
+	if (option && ini_set_option_value(option, value))
+	{
+		log_debug("ini_set_option %s.%s = %s",
+				  option->section, option->name, value);
+
+		return true;
 	}
 
 	return false;
@@ -550,8 +700,6 @@ bool
 ini_set_setting(const char *filename, IniOption *optionList,
 				const char *path, char *value)
 {
-	IniOption *option = NULL;
-
 	log_debug("Reading configuration from %s", filename);
 
 	if (!read_ini_file(filename, optionList))
@@ -560,12 +708,5 @@ ini_set_setting(const char *filename, IniOption *optionList,
 		return false;
 	}
 
-	option = lookup_ini_path_value(optionList, path);
-
-	if (option && ini_set_option_value(option, value))
-	{
-		return true;
-	}
-
-	return false;
+	return ini_set_option(optionList, path, value);
 }

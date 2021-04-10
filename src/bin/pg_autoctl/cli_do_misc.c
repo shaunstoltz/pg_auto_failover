@@ -14,12 +14,15 @@
 #include <signal.h>
 
 #include "postgres_fe.h"
+#include "pqexpbuffer.h"
 
 #include "cli_common.h"
 #include "cli_do_root.h"
+#include "cli_root.h"
 #include "commandline.h"
 #include "config.h"
 #include "defaults.h"
+#include "env_utils.h"
 #include "file_utils.h"
 #include "fsm.h"
 #include "keeper_config.h"
@@ -27,7 +30,9 @@
 #include "monitor.h"
 #include "monitor_config.h"
 #include "pgctl.h"
+#include "pgtuning.h"
 #include "primary_standby.h"
+#include "string_utils.h"
 
 
 /*
@@ -75,50 +80,6 @@ keeper_cli_drop_replication_slot(int argc, char **argv)
 
 
 /*
- * keeper_cli_enable_synchronous_replication implements the CLI to enable
- * synchronous replication on the primary.
- */
-void
-keeper_cli_enable_synchronous_replication(int argc, char **argv)
-{
-	KeeperConfig config = keeperOptions;
-	LocalPostgresServer postgres = { 0 };
-	bool missingPgdataOk = false;
-	bool pgNotRunningOk = false;
-
-	keeper_config_init(&config, missingPgdataOk, pgNotRunningOk);
-	local_postgres_init(&postgres, &(config.pgSetup));
-
-	if (!primary_enable_synchronous_replication(&postgres))
-	{
-		exit(EXIT_CODE_PGSQL);
-	}
-}
-
-
-/*
- * keeper_cli_disable_synchronous_replication implements the CLI to disable
- * synchronous replication on the primary.
- */
-void
-keeper_cli_disable_synchronous_replication(int argc, char **argv)
-{
-	KeeperConfig config = keeperOptions;
-	LocalPostgresServer postgres = { 0 };
-	bool missingPgdataOk = false;
-	bool pgNotRunningOk = false;
-
-	keeper_config_init(&config, missingPgdataOk, pgNotRunningOk);
-	local_postgres_init(&postgres, &(config.pgSetup));
-
-	if (!primary_disable_synchronous_replication(&postgres))
-	{
-		exit(EXIT_CODE_PGSQL);
-	}
-}
-
-
-/*
  * keeper_cli_add_defaults implements the CLI to add pg_auto_failover default
  * settings to postgresql.conf
  */
@@ -154,20 +115,14 @@ keeper_cli_create_monitor_user(int argc, char **argv)
 	LocalPostgresServer postgres = { 0 };
 	bool missingPgdataOk = false;
 	bool postgresNotRunningOk = false;
-	int urlLength = 0;
 	char monitorHostname[_POSIX_HOST_NAME_MAX];
 	int monitorPort = 0;
-
-	/*
-	 * Monitor does not use a password, we expect it to login and immediately
-	 * disconnect.
-	 */
-	char *password = NULL;
+	int connlimit = 1;
 
 	keeper_config_init(&config, missingPgdataOk, postgresNotRunningOk);
 	local_postgres_init(&postgres, &(config.pgSetup));
 
-	urlLength = strlcpy(config.monitor_pguri, argv[0], MAXCONNINFO);
+	int urlLength = strlcpy(config.monitor_pguri, argv[0], MAXCONNINFO);
 	if (urlLength >= MAXCONNINFO)
 	{
 		log_fatal("Monitor URL \"%s\" given in command line is %d characters, "
@@ -185,9 +140,12 @@ keeper_cli_create_monitor_user(int argc, char **argv)
 	}
 
 	if (!primary_create_user_with_hba(&postgres,
-									  PG_AUTOCTL_HEALTH_USERNAME, password,
+									  PG_AUTOCTL_HEALTH_USERNAME,
+									  PG_AUTOCTL_HEALTH_PASSWORD,
 									  monitorHostname,
-									  pg_setup_get_auth_method(&(config.pgSetup))))
+									  "trust",
+									  HBA_EDIT_MINIMAL,
+									  connlimit))
 	{
 		log_fatal("Failed to create the database user that the pg_auto_failover "
 				  " monitor uses for health checks, see above for details");
@@ -222,46 +180,108 @@ keeper_cli_create_replication_user(int argc, char **argv)
 
 
 /*
- * keeper_add_standby_to_hba implements the CLI to add the pg_auto_failover
- * replication user to pg_hba.
+ * keeper_cli_pgsetup_pg_ctl implements the CLI to find a suitable pg_ctl entry
+ * from either the PG_CONFIG environment variable, or the PATH, then either
+ * finding a single pg_ctl entry or falling back to a single pg_config entry
+ * that we then use with pg_config --bindir.
  */
 void
-keeper_cli_add_standby_to_hba(int argc, char **argv)
+keeper_cli_pgsetup_pg_ctl(int argc, char **argv)
 {
-	KeeperConfig config = keeperOptions;
-	LocalPostgresServer postgres = { 0 };
-	char standbyHostname[_POSIX_HOST_NAME_MAX];
-	bool missingPgdataOk = false;
-	bool postgresNotRunningOk = false;
-	int hostLength = 0;
+	bool success = true;
 
-	keeper_config_init(&config, missingPgdataOk, postgresNotRunningOk);
-	local_postgres_init(&postgres, &(config.pgSetup));
+	PostgresSetup pgSetupMonitor = { 0 }; /* find first entry */
+	PostgresSetup pgSetupKeeper = { 0 };  /* find non ambiguous entry */
 
-	if (argc != 1)
+	char PG_CONFIG[MAXPGPATH] = { 0 };
+
+	if (env_exists("PG_CONFIG") &&
+		get_env_copy("PG_CONFIG", PG_CONFIG, sizeof(PG_CONFIG)))
 	{
-		log_error("a standby hostname is required");
-		commandline_help(stderr);
-		exit(EXIT_CODE_BAD_ARGS);
+		log_info("Environment variable PG_CONFIG is set to \"%s\"", PG_CONFIG);
 	}
 
-	hostLength = strlcpy(standbyHostname, argv[0],
-						 _POSIX_HOST_NAME_MAX);
-	if (hostLength >= _POSIX_HOST_NAME_MAX)
+	if (config_find_pg_ctl(&pgSetupKeeper))
 	{
-		log_fatal("Hostname \"%s\" given in command line is %d characters, "
-				  "the maximum supported by pg_autoctl is %d",
-				  argv[0], hostLength, MAXCONNINFO - 1);
-		exit(EXIT_CODE_BAD_ARGS);
+		log_info("`pg_autoctl create postgres` would use \"%s\" for Postgres %s",
+				 pgSetupKeeper.pg_ctl, pgSetupKeeper.pg_version);
+	}
+	else
+	{
+		log_fatal("pg_autoctl create postgres would fail to find pg_ctl");
+		success = false;
 	}
 
-	if (!primary_add_standby_to_hba(&postgres, standbyHostname, config.replication_password))
+	/*
+	 * This function EXITs when it's not happy, so we do it last:
+	 */
+	(void) set_first_pgctl(&pgSetupMonitor);
+
+	log_info("`pg_autoctl create monitor` would use \"%s\" for Postgres %s",
+			 pgSetupMonitor.pg_ctl, pgSetupMonitor.pg_version);
+
+	if (!success)
 	{
-		log_fatal("Failed to grant access to the standby by adding relevant lines to "
-				  "pg_hba.conf for the standby hostname and user, see above for "
-				  "details");
-		exit(EXIT_CODE_PGSQL);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+}
+
+
+/*
+ * keeper_cli_pgsetup_discover implements the CLI to discover a PostgreSQL
+ * setup thanks to PGDATA and other environment variables.
+ */
+void
+keeper_cli_pgsetup_discover(int argc, char **argv)
+{
+	bool missingPgdataOk = true;
+	PostgresSetup pgSetup = { 0 };
+
+	if (!pg_setup_init(&pgSetup, &keeperOptions.pgSetup, true, true))
+	{
+		exit(EXIT_CODE_PGCTL);
+	}
+
+	if (!pg_controldata(&pgSetup, missingPgdataOk))
+	{
+		exit(EXIT_CODE_PGCTL);
+	}
+
+	if (!IS_EMPTY_STRING_BUFFER(keeperOptions.hostname))
+	{
+		fformat(stdout, "Node Name:          %s\n", keeperOptions.hostname);
+	}
+
+	fprintf_pg_setup(stdout, &pgSetup);
+}
+
+
+/*
+ * keeper_cli_pgsetup_is_ready returns success when the local PostgreSQL setup
+ * belongs to a server that is "ready".
+ */
+void
+keeper_cli_pgsetup_is_ready(int argc, char **argv)
+{
+	PostgresSetup pgSetup = { 0 };
+	bool pgIsNotRunningIsOk = false;
+
+	if (!pg_setup_init(&pgSetup, &keeperOptions.pgSetup, true, true))
+	{
+		exit(EXIT_CODE_PGCTL);
+	}
+
+	log_debug("Initialized pgSetup, now calling pg_setup_is_ready()");
+
+	bool pgIsReady = pg_setup_is_ready(&pgSetup, pgIsNotRunningIsOk);
+
+	log_info("Postgres status is: \"%s\"", pmStatusToString(pgSetup.pm_status));
+
+	if (pgIsReady)
+	{
+		exit(EXIT_CODE_QUIT);
+	}
+	exit(EXIT_CODE_PGSQL);
 }
 
 
@@ -270,7 +290,35 @@ keeper_cli_add_standby_to_hba(int argc, char **argv)
  * setup thanks to PGDATA and other environment variables.
  */
 void
-keeper_cli_discover_pg_setup(int argc, char **argv)
+keeper_cli_pgsetup_wait_until_ready(int argc, char **argv)
+{
+	int timeout = 30;
+	PostgresSetup pgSetup = { 0 };
+
+	if (!pg_setup_init(&pgSetup, &keeperOptions.pgSetup, true, true))
+	{
+		exit(EXIT_CODE_PGCTL);
+	}
+
+	log_debug("Initialized pgSetup, now calling pg_setup_wait_until_is_ready()");
+
+	bool pgIsReady = pg_setup_wait_until_is_ready(&pgSetup, timeout, LOG_INFO);
+
+	log_info("Postgres status is: \"%s\"", pmStatusToString(pgSetup.pm_status));
+
+	if (pgIsReady)
+	{
+		exit(EXIT_CODE_QUIT);
+	}
+	exit(EXIT_CODE_PGSQL);
+}
+
+
+/*
+ * keeper_cli_pgsetup_startup_logs logs the Postgres startup logs.
+ */
+void
+keeper_cli_pgsetup_startup_logs(int argc, char **argv)
 {
 	PostgresSetup pgSetup = { 0 };
 
@@ -279,26 +327,44 @@ keeper_cli_discover_pg_setup(int argc, char **argv)
 		exit(EXIT_CODE_PGCTL);
 	}
 
-	if (!IS_EMPTY_STRING_BUFFER(keeperOptions.nodename))
-	{
-		fprintf(stdout, "Node Name:          %s\n", keeperOptions.nodename);
-	}
+	log_debug("Initialized pgSetup, now calling pg_log_startup()");
 
-	fprintf_pg_setup(stdout, &pgSetup);
+	if (!pg_log_startup(pgSetup.pgdata, LOG_INFO))
+	{
+		exit(EXIT_CODE_PGCTL);
+	}
 }
 
 
+/*
+ * keeper_cli_pgsetup_tune compute some Postgres tuning for the local system.
+ */
+void
+keeper_cli_pgsetup_tune(int argc, char **argv)
+{
+	char config[BUFSIZE] = { 0 };
+
+	if (!pgtuning_prepare_guc_settings(postgres_tuning, config, BUFSIZE))
+	{
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	fformat(stdout, "%s\n", config);
+}
+
+
+/*
+ * keeper_cli_init_standby initializes a standby
+ */
 void
 keeper_cli_init_standby(int argc, char **argv)
 {
 	const bool missing_pgdata_is_ok = true;
 	const bool pg_not_running_is_ok = true;
+	const bool skipBaseBackup = false;
 
 	KeeperConfig config = keeperOptions;
 	LocalPostgresServer postgres = { 0 };
-	ReplicationSource replicationSource = { 0 };
-
-	int hostLength = 0;
 
 	if (argc != 2)
 	{
@@ -309,8 +375,8 @@ keeper_cli_init_standby(int argc, char **argv)
 	keeper_config_init(&config, missing_pgdata_is_ok, pg_not_running_is_ok);
 	local_postgres_init(&postgres, &(config.pgSetup));
 
-	hostLength = strlcpy(replicationSource.primaryNode.host, argv[0],
-						 _POSIX_HOST_NAME_MAX);
+	int hostLength = strlcpy(postgres.replicationSource.primaryNode.host, argv[0],
+							 _POSIX_HOST_NAME_MAX);
 	if (hostLength >= _POSIX_HOST_NAME_MAX)
 	{
 		log_fatal("Hostname \"%s\" given in command line is %d characters, "
@@ -319,22 +385,32 @@ keeper_cli_init_standby(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	if (sscanf(argv[1], "%d", &replicationSource.primaryNode.port) == 0)
+	if (!stringToInt(argv[1], &(postgres.replicationSource.primaryNode.port)))
 	{
 		log_fatal("Argument is not a valid port number: \"%s\"", argv[1]);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	replicationSource.userName = PG_AUTOCTL_REPLICA_USERNAME;
-	replicationSource.password = config.replication_password;
-	replicationSource.slotName = config.replication_slot_name;
-	replicationSource.maximumBackupRate = MAXIMUM_BACKUP_RATE;
-
-	if (!standby_init_database(&postgres, &replicationSource))
+	if (!standby_init_replication_source(&postgres,
+										 NULL, /* primaryNode is done */
+										 PG_AUTOCTL_REPLICA_USERNAME,
+										 config.replication_password,
+										 config.replication_slot_name,
+										 config.maximum_backup_rate,
+										 config.backupDirectory,
+										 NULL, /* no targetLSN */
+										 config.pgSetup.ssl,
+										 0))
 	{
-		log_fatal("Failed to grant access to the standby by adding relevant lines to "
-				  "pg_hba.conf for the standby hostname and user, see above for "
-				  "details");
+		/* can't happen at the moment */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!standby_init_database(&postgres, config.hostname, skipBaseBackup))
+	{
+		log_fatal("Failed to grant access to the standby by adding "
+				  "relevant lines to pg_hba.conf for the "
+				  "standby hostname and user, see above for details");
 		exit(EXIT_CODE_PGSQL);
 	}
 }
@@ -345,11 +421,9 @@ keeper_cli_rewind_old_primary(int argc, char **argv)
 {
 	const bool missing_pgdata_is_ok = false;
 	const bool pg_not_running_is_ok = true;
-	int hostLength = 0;
 
 	KeeperConfig config = keeperOptions;
 	LocalPostgresServer postgres = { 0 };
-	ReplicationSource replicationSource = { 0 };
 
 	if (argc < 1 || argc > 2)
 	{
@@ -360,8 +434,8 @@ keeper_cli_rewind_old_primary(int argc, char **argv)
 	keeper_config_init(&config, missing_pgdata_is_ok, pg_not_running_is_ok);
 	local_postgres_init(&postgres, &(config.pgSetup));
 
-	hostLength = strlcpy(replicationSource.primaryNode.host, argv[0],
-						 _POSIX_HOST_NAME_MAX);
+	int hostLength = strlcpy(postgres.replicationSource.primaryNode.host, argv[0],
+							 _POSIX_HOST_NAME_MAX);
 	if (hostLength >= _POSIX_HOST_NAME_MAX)
 	{
 		log_fatal("Hostname \"%s\" given in command line is %d characters, "
@@ -370,18 +444,28 @@ keeper_cli_rewind_old_primary(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	if (sscanf(argv[1], "%d", &replicationSource.primaryNode.port) == 0)
+	if (!stringToInt(argv[1], &(postgres.replicationSource.primaryNode.port)))
 	{
 		log_fatal("Argument is not a valid port number: \"%s\"", argv[1]);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	replicationSource.userName = PG_AUTOCTL_REPLICA_USERNAME;
-	replicationSource.password = config.replication_password;
-	replicationSource.slotName = config.replication_slot_name;
-	replicationSource.maximumBackupRate = MAXIMUM_BACKUP_RATE;
+	if (!standby_init_replication_source(&postgres,
+										 NULL, /* primaryNode is done */
+										 PG_AUTOCTL_REPLICA_USERNAME,
+										 config.replication_password,
+										 config.replication_slot_name,
+										 config.maximum_backup_rate,
+										 config.backupDirectory,
+										 NULL, /* no targetLSN */
+										 config.pgSetup.ssl,
+										 0))
+	{
+		/* can't happen at the moment */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 
-	if (!primary_rewind_to_standby(&postgres, &replicationSource))
+	if (!primary_rewind_to_standby(&postgres))
 	{
 		log_fatal("Failed to rewind a demoted primary to standby, "
 				  "see above for details");
@@ -410,114 +494,56 @@ keeper_cli_promote_standby(int argc, char **argv)
 
 
 /*
- * keeper_cli_destroy_node cleans up our testing area:
+ * keeper_cli_identify_system connects to a Postgres server using the
+ * replication protocol to run the IDENTIFY_SYSTEM command.
  *
- *  - pgautofailover.remove_node() on the monitor
- *  - remove the state file
- *  - stops PostgreSQL
- *  - rm -rf PGDATA
+ * The IDENTIFY_SYSTEM replication command requests the server to identify
+ * itself. We use this command mostly to ensure that we can establish a
+ * replication connection to the upstream/primary server, which means that the
+ * HBA setup is good to go.
  *
+ * See https://www.postgresql.org/docs/12/protocol-replication.html for more
+ * information about the replication protocol and commands.
  */
 void
-keeper_cli_destroy_node(int argc, char **argv)
+keeper_cli_identify_system(int argc, char **argv)
 {
-	Keeper keeper = { 0 };
+	const bool missing_pgdata_is_ok = true;
+	const bool pg_not_running_is_ok = true;
+
 	KeeperConfig config = keeperOptions;
+	ReplicationSource replicationSource = { 0 };
 
-	bool missing_pgdata_is_ok = true;
-	bool pg_is_not_running_is_ok = true;
-
-	if (!keeper_config_set_pathnames_from_pgdata(&config.pathnames, config.pgSetup.pgdata))
+	if (argc != 2)
 	{
-		/* errors have already been logged */
+		commandline_print_usage(&do_primary_identify_system, stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	switch (ProbeConfigurationFileRole(config.pathnames.config))
+	keeper_config_init(&config, missing_pgdata_is_ok, pg_not_running_is_ok);
+
+	int hostLength = strlcpy(replicationSource.primaryNode.host, argv[0],
+							 _POSIX_HOST_NAME_MAX);
+	if (hostLength >= _POSIX_HOST_NAME_MAX)
 	{
-		case PG_AUTOCTL_ROLE_MONITOR:
-		{
-			Monitor monitor = { 0 };
-			MonitorConfig mconfig = { 0 };
-			bool missingPgdataIsOk = true;
-			bool pgIsNotRunningIsOk = true;
-
-			if (!monitor_config_init_from_pgsetup(&monitor, &mconfig,
-												  &config.pgSetup,
-												  missingPgdataIsOk,
-												  pgIsNotRunningIsOk))
-			{
-				/* errors have already been logged */
-				exit(EXIT_CODE_BAD_CONFIG);
-			}
-
-			stop_postgres_and_remove_pgdata_and_config(&mconfig.pathnames,
-													   &mconfig.pgSetup);
-			break;
-		}
-
-		case PG_AUTOCTL_ROLE_KEEPER:
-		{
-			keeper_config_read_file(&config,
-									missing_pgdata_is_ok,
-									pg_is_not_running_is_ok);
-
-			keeper_cli_destroy_keeper_node(&keeper, &config);
-			break;
-		}
-
-		default:
-		{
-			log_fatal("Unrecognized configuration file \"%s\"",
-					  config.pathnames.config);
-			exit(EXIT_CODE_BAD_CONFIG);
-		}
-	}
-}
-
-
-/*
- * keeper_cli_destroy_keeper_node destroys a keeper node.
- */
-void
-keeper_cli_destroy_keeper_node(Keeper *keeper, KeeperConfig *config)
-{
-	/* maybe stop running keeper service first */
-	if (file_exists(config->pathnames.pid))
-	{
-		pid_t pid = 0;
-
-		if (read_pidfile(config->pathnames.pid, &pid))
-		{
-			log_info("An instance of this keeper is running with PID %d, "
-					 "stopping it.", pid);
-
-			if (kill(pid, SIGQUIT) != 0)
-			{
-				log_error("Failed to send SIGQUIT to the keeper's pid %d: %s",
-						  pid, strerror(errno));
-				exit(EXIT_CODE_INTERNAL_ERROR);
-			}
-		}
+		log_fatal("Hostname \"%s\" given in command line is %d characters, "
+				  "the maximum supported by pg_autoctl is %d",
+				  argv[0], hostLength, _POSIX_HOST_NAME_MAX - 1);
+		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	/* only keeper_remove when we still have a state file around */
-	if (file_exists(config->pathnames.state))
+	if (!stringToInt(argv[1], &(replicationSource.primaryNode.port)))
 	{
-		/* keeper_remove uses log_info() to explain what's happening */
-		if (!keeper_remove(keeper, config))
-		{
-			log_fatal("Failed to remove local node from the pg_auto_failover "
-					  "monitor, see above for details");
-			exit(EXIT_CODE_INTERNAL_ERROR);
-		}
-	}
-	else
-	{
-		log_warn("State file \"%s\" does not exist, skipping keeper remove step",
-				 config->pathnames.state);
+		log_fatal("Argument is not a valid port number: \"%s\"", argv[1]);
+		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	stop_postgres_and_remove_pgdata_and_config(&(config->pathnames),
-											   &(config->pgSetup));
+	strlcpy(replicationSource.applicationName, "pg_autoctl", MAXCONNINFO);
+	strlcpy(replicationSource.userName, PG_AUTOCTL_REPLICA_USERNAME, NAMEDATALEN);
+
+	if (!pgctl_identify_system(&replicationSource))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 }

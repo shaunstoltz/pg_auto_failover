@@ -29,13 +29,13 @@ typedef struct SystemdServiceConfig
 	char ExecStart[BUFSIZE];
 	char Restart[BUFSIZE];
 	int StartLimitBurst;
+	char ExecReload[BUFSIZE];
 
 	/* Install */
 	char WantedBy[BUFSIZE];
 
 	/* PostgreSQL setup */
 	PostgresSetup pgSetup;
-
 } SystemdServiceConfig;
 
 void systemd_config_init(SystemdServiceConfig *config, const char *pgdata);

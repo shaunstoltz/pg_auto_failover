@@ -18,7 +18,8 @@ CommandLine help =
 
 CommandLine version =
 	make_command("version", "print pg_autoctl version", "", "",
-				 NULL, keeper_cli_print_version);
+				 cli_print_version_getopts,
+				 keeper_cli_print_version);
 
 /* non-local to be able to patch it from other files */
 CommandLine *create_subcommands[] = {
@@ -33,10 +34,29 @@ CommandLine create_commands =
 					 "Create a pg_auto_failover node, or formation", NULL, NULL,
 					 NULL, create_subcommands);
 
+CommandLine *show_subcommands_with_debug[] = {
+	&show_uri_command,
+	&show_events_command,
+	&show_state_command,
+	&show_settings_command,
+	&show_standby_names_command,
+	&show_file_command,
+	&systemd_cat_service_file_command,
+	NULL
+};
+
+CommandLine show_commands_with_debug =
+	make_command_set("show",
+					 "Show pg_auto_failover information", NULL, NULL,
+					 NULL, show_subcommands_with_debug);
+
 CommandLine *show_subcommands[] = {
 	&show_uri_command,
 	&show_events_command,
 	&show_state_command,
+	&show_settings_command,
+	&show_standby_names_command,
+	&show_file_command,
 	&systemd_cat_service_file_command,
 	NULL
 };
@@ -47,6 +67,7 @@ CommandLine show_commands =
 					 NULL, show_subcommands);
 
 CommandLine *drop_subcommands[] = {
+	&drop_monitor_command,
 	&drop_node_command,
 	&drop_formation_command,
 	NULL
@@ -64,13 +85,17 @@ CommandLine *root_subcommands_with_debug[] = {
 	&create_commands,
 	&drop_commands,
 	&config_commands,
-	&show_commands,
+	&show_commands_with_debug,
 	&enable_commands,
 	&disable_commands,
+	&get_commands,
+	&set_commands,
+	&perform_commands,
 	&do_commands,
 	&service_run_command,
 	&service_stop_command,
 	&service_reload_command,
+	&service_status_command,
 	&help,
 	&version,
 	NULL
@@ -90,9 +115,13 @@ CommandLine *root_subcommands[] = {
 	&show_commands,
 	&enable_commands,
 	&disable_commands,
+	&get_commands,
+	&set_commands,
+	&perform_commands,
 	&service_run_command,
 	&service_stop_command,
 	&service_reload_command,
+	&service_status_command,
 	&help,
 	&version,
 	NULL
@@ -112,13 +141,15 @@ CommandLine root =
 int
 root_options(int argc, char **argv)
 {
-	int debugCount = 0;
 	int verboseCount = 0;
+	bool printVersion = false;
 
 	static struct option long_options[] = {
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "json", no_argument, NULL, 'J' },
 		{ "quiet", no_argument, NULL, 'q' },
+		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -126,15 +157,21 @@ root_options(int argc, char **argv)
 
 	optind = 0;
 
-	while ((c = getopt_long(argc, argv, "Vvq",
+	while ((c = getopt_long(argc, argv, "JVvqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
 		{
+			case 'J':
+			{
+				outputJSON = true;
+				log_trace("--json");
+				break;
+			}
+
 			case 'V':
 			{
-				/* keeper_cli_print_version prints version and exits. */
-				keeper_cli_print_version(argc, argv);
+				printVersion = true;
 				break;
 			}
 
@@ -144,16 +181,22 @@ root_options(int argc, char **argv)
 				switch (verboseCount)
 				{
 					case 1:
+					{
 						log_set_level(LOG_INFO);
 						break;
+					}
 
 					case 2:
+					{
 						log_set_level(LOG_DEBUG);
 						break;
+					}
 
 					default:
+					{
 						log_set_level(LOG_TRACE);
 						break;
+					}
 				}
 				break;
 			}
@@ -161,6 +204,13 @@ root_options(int argc, char **argv)
 			case 'q':
 			{
 				log_set_level(LOG_ERROR);
+				break;
+			}
+
+			case 'h':
+			{
+				commandline_help(stderr);
+				exit(EXIT_CODE_QUIT);
 				break;
 			}
 
@@ -178,34 +228,11 @@ root_options(int argc, char **argv)
 		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
-	return optind;
-}
 
-
-/*
- * Provide help.
- */
-void
-keeper_cli_help(int argc, char **argv)
-{
-	CommandLine command = root;
-
-	if (getenv(PG_AUTOCTL_DEBUG) != NULL)
+	if (printVersion)
 	{
-		command = root_with_debug;
+		keeper_cli_print_version(argc, argv);
 	}
 
-	(void) commandline_print_command_tree(&command, stdout);
-}
-
-
-/*
- * keeper_cli_print_version prints the pg_autoctl version and exits with
- * successful exit code of zero.
- */
-void
-keeper_cli_print_version(int argc, char **argv)
-{
-	fprintf(stdout, "pg_autoctl version %s\n", PG_AUTOCTL_VERSION);
-	exit(0);
+	return optind;
 }

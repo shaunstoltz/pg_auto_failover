@@ -17,6 +17,7 @@
 #include "keeper.h"
 #include "keeper_config.h"
 #include "log.h"
+#include "parsing.h"
 #include "pgctl.h"
 
 #define OPTION_AUTOCTL_ROLE(config) \
@@ -24,7 +25,7 @@
 							   config->role, KEEPER_ROLE)
 
 #define OPTION_AUTOCTL_MONITOR(config) \
-	make_strbuf_option("pg_autoctl", "monitor", "monitor", true, MAXCONNINFO, \
+	make_strbuf_option("pg_autoctl", "monitor", "monitor", false, MAXCONNINFO, \
 					   config->monitor_pguri)
 
 #define OPTION_AUTOCTL_FORMATION(config) \
@@ -35,10 +36,25 @@
 #define OPTION_AUTOCTL_GROUPID(config) \
 	make_int_option("pg_autoctl", "group", "group", false, &(config->groupId))
 
+#define OPTION_AUTOCTL_NAME(config) \
+	make_strbuf_option_default("pg_autoctl", "name", "name", \
+							   false, _POSIX_HOST_NAME_MAX, \
+							   config->name, "")
+
+/*
+ * --hostname used to be --nodename, and we need to support transition from the
+ * old to the new name. For that, we read the pg_autoctl.nodename config
+ * setting and change it on the fly to hostname instead.
+ *
+ * As a result HOSTNAME is marked not required and NODENAME is marked compat.
+ */
+#define OPTION_AUTOCTL_HOSTNAME(config) \
+	make_strbuf_option("pg_autoctl", "hostname", "hostname", \
+					   false, _POSIX_HOST_NAME_MAX, config->hostname)
+
 #define OPTION_AUTOCTL_NODENAME(config) \
-	make_strbuf_option("pg_autoctl", "nodename", "nodename", \
-					   true, _POSIX_HOST_NAME_MAX, \
-					   config->nodename)
+	make_strbuf_compat_option("pg_autoctl", "nodename", \
+							  _POSIX_HOST_NAME_MAX, config->hostname)
 
 #define OPTION_AUTOCTL_NODEKIND(config) \
 	make_strbuf_option("pg_autoctl", "nodekind", NULL, false, NAMEDATALEN, \
@@ -70,7 +86,7 @@
 	make_int_option("postgresql", "port", "pgport", \
 					true, &(config->pgSetup.pgport))
 
-#define OPTION_POSTGRESQL_PROXY_PORT(config)				\
+#define OPTION_POSTGRESQL_PROXY_PORT(config) \
 	make_int_option("postgresql", "proxyport", "proxyport", \
 					false, &(config->pgSetup.proxyport))
 
@@ -78,20 +94,53 @@
 	make_strbuf_option("postgresql", "listen_addresses", "listen", \
 					   false, MAXPGPATH, config->pgSetup.listen_addresses)
 
-#define OPTION_REPLICATION_SLOT_NAME(config) \
-	make_string_option_default("replication", "slot", NULL, false, \
-							   &config->replication_slot_name, \
-							   REPLICATION_SLOT_NAME_DEFAULT)
+#define OPTION_POSTGRESQL_AUTH_METHOD(config) \
+	make_strbuf_option("postgresql", "auth_method", "auth", \
+					   false, MAXPGPATH, config->pgSetup.authMethod)
+
+#define OPTION_POSTGRESQL_HBA_LEVEL(config) \
+	make_strbuf_option("postgresql", "hba_level", NULL, \
+					   false, MAXPGPATH, config->pgSetup.hbaLevelStr)
+
+#define OPTION_SSL_ACTIVE(config) \
+	make_int_option_default("ssl", "active", NULL, \
+							false, &(config->pgSetup.ssl.active), 0)
+
+#define OPTION_SSL_MODE(config) \
+	make_strbuf_option("ssl", "sslmode", "ssl-mode", \
+					   false, SSL_MODE_STRLEN, config->pgSetup.ssl.sslModeStr)
+
+#define OPTION_SSL_CA_FILE(config) \
+	make_strbuf_option("ssl", "ca_file", "ssl-ca-file", \
+					   false, MAXPGPATH, config->pgSetup.ssl.caFile)
+
+#define OPTION_SSL_CRL_FILE(config) \
+	make_strbuf_option("ssl", "crl_file", "ssl-crl-file", \
+					   false, MAXPGPATH, config->pgSetup.ssl.crlFile)
+
+#define OPTION_SSL_SERVER_CERT(config) \
+	make_strbuf_option("ssl", "cert_file", "server-cert", \
+					   false, MAXPGPATH, config->pgSetup.ssl.serverCert)
+
+#define OPTION_SSL_SERVER_KEY(config) \
+	make_strbuf_option("ssl", "key_file", "server-key", \
+					   false, MAXPGPATH, config->pgSetup.ssl.serverKey)
 
 #define OPTION_REPLICATION_PASSWORD(config) \
-	make_string_option_default("replication", "password", NULL, \
-							   false, &config->replication_password, \
+	make_strbuf_option_default("replication", "password", NULL, \
+							   false, MAXCONNINFO, \
+							   config->replication_password, \
 							   REPLICATION_PASSWORD_DEFAULT)
 
 #define OPTION_REPLICATION_MAXIMUM_BACKUP_RATE(config) \
-	make_string_option_default("replication", "maximum_backup_rate", NULL, \
-							   false, &config->maximum_backup_rate, \
+	make_strbuf_option_default("replication", "maximum_backup_rate", NULL, \
+							   false, MAXIMUM_BACKUP_RATE_LEN, \
+							   config->maximum_backup_rate, \
 							   MAXIMUM_BACKUP_RATE)
+
+#define OPTION_REPLICATION_BACKUP_DIR(config) \
+	make_strbuf_option("replication", "backup_directory", NULL, \
+					   false, MAXPGPATH, config->backupDirectory)
 
 #define OPTION_TIMEOUT_NETWORK_PARTITION(config) \
 	make_int_option_default("timeout", "network_partition_timeout", \
@@ -127,12 +176,23 @@
 							&(config->postgresql_restart_failure_max_retries), \
 							POSTGRESQL_FAILS_TO_START_RETRIES)
 
+#define OPTION_CITUS_ROLE(config) \
+	make_strbuf_option_default("citus", "role", NULL, false, NAMEDATALEN, \
+							   config->citusRoleStr, DEFAULT_CITUS_ROLE)
+
+#define OPTION_CITUS_CLUSTER_NAME(config) \
+	make_strbuf_option("citus", "cluster_name", "citus-cluster", \
+					   false, NAMEDATALEN, config->pgSetup.citusClusterName)
+
+
 #define SET_INI_OPTIONS_ARRAY(config) \
 	{ \
 		OPTION_AUTOCTL_ROLE(config), \
 		OPTION_AUTOCTL_MONITOR(config), \
 		OPTION_AUTOCTL_FORMATION(config), \
 		OPTION_AUTOCTL_GROUPID(config), \
+		OPTION_AUTOCTL_NAME(config), \
+		OPTION_AUTOCTL_HOSTNAME(config), \
 		OPTION_AUTOCTL_NODENAME(config), \
 		OPTION_AUTOCTL_NODEKIND(config), \
 		OPTION_POSTGRESQL_PGDATA(config), \
@@ -143,18 +203,31 @@
 		OPTION_POSTGRESQL_PORT(config), \
 		OPTION_POSTGRESQL_PROXY_PORT(config), \
 		OPTION_POSTGRESQL_LISTEN_ADDRESSES(config), \
-		OPTION_REPLICATION_PASSWORD(config), \
-		OPTION_REPLICATION_SLOT_NAME(config), \
+		OPTION_POSTGRESQL_AUTH_METHOD(config), \
+		OPTION_POSTGRESQL_HBA_LEVEL(config), \
+		OPTION_SSL_ACTIVE(config), \
+		OPTION_SSL_MODE(config), \
+		OPTION_SSL_CA_FILE(config), \
+		OPTION_SSL_CRL_FILE(config), \
+		OPTION_SSL_SERVER_CERT(config), \
+		OPTION_SSL_SERVER_KEY(config), \
 		OPTION_REPLICATION_MAXIMUM_BACKUP_RATE(config), \
+		OPTION_REPLICATION_BACKUP_DIR(config), \
+		OPTION_REPLICATION_PASSWORD(config), \
 		OPTION_TIMEOUT_NETWORK_PARTITION(config), \
 		OPTION_TIMEOUT_PREPARE_PROMOTION_CATCHUP(config), \
 		OPTION_TIMEOUT_PREPARE_PROMOTION_WALRECEIVER(config), \
 		OPTION_TIMEOUT_POSTGRESQL_RESTART_FAILURE_TIMEOUT(config), \
 		OPTION_TIMEOUT_POSTGRESQL_RESTART_FAILURE_MAX_RETRIES(config), \
+ \
+		OPTION_CITUS_ROLE(config), \
+		OPTION_CITUS_CLUSTER_NAME(config), \
 		INI_OPTION_LAST \
 	}
 
 static bool keeper_config_init_nodekind(KeeperConfig *config);
+static bool keeper_config_init_hbalevel(KeeperConfig *config);
+static bool keeper_config_set_backup_directory(KeeperConfig *config, int nodeId);
 
 
 /*
@@ -187,25 +260,35 @@ keeper_config_set_pathnames_from_pgdata(ConfigFilePaths *pathnames,
 		return false;
 	}
 
+	if (!SetNodesFilePath(pathnames, pgdata))
+	{
+		log_fatal("Failed to set pid filename from PGDATA \"%s\","
+				  " see above for details.", pgdata);
+		return false;
+	}
+
 	if (!SetPidFilePath(pathnames, pgdata))
 	{
 		log_fatal("Failed to set pid filename from PGDATA \"%s\","
 				  " see above for details.", pgdata);
 		return false;
 	}
+
 	return true;
 }
 
 
 /*
- * keeper_config_init initialises a KeeperConfig with the default values.
+ * keeper_config_init initializes a KeeperConfig with the default values.
  */
 void
 keeper_config_init(KeeperConfig *config,
-				   bool missing_pgdata_is_ok, bool pg_is_not_running_is_ok)
+				   bool missingPgdataIsOk, bool pgIsNotRunningIsOk)
 {
 	PostgresSetup pgSetup = { 0 };
 	IniOption keeperOptions[] = SET_INI_OPTIONS_ARRAY(config);
+
+	log_trace("keeper_config_init");
 
 	if (!ini_validate_options(keeperOptions))
 	{
@@ -220,10 +303,17 @@ keeper_config_init(KeeperConfig *config,
 		exit(EXIT_CODE_BAD_CONFIG);
 	}
 
+	if (!keeper_config_init_hbalevel(config))
+	{
+		log_error("Failed to initialize postgresql.hba_level");
+		log_error("Please review your setup options per above messages");
+		exit(EXIT_CODE_BAD_CONFIG);
+	}
+
 	if (!pg_setup_init(&pgSetup,
 					   &(config->pgSetup),
-					   missing_pgdata_is_ok,
-					   pg_is_not_running_is_ok))
+					   missingPgdataIsOk,
+					   pgIsNotRunningIsOk))
 	{
 		log_error("Please fix your PostgreSQL setup per above messages");
 		exit(EXIT_CODE_BAD_CONFIG);
@@ -233,7 +323,17 @@ keeper_config_init(KeeperConfig *config,
 	 * Keep the whole set of values discovered in pg_setup_init from the
 	 * configuration file
 	 */
-	memcpy(&(config->pgSetup), &pgSetup, sizeof(PostgresSetup));
+	config->pgSetup = pgSetup;
+
+	/*
+	 * Compute the backupDirectory from pgdata, or check the one given in the
+	 * configuration file already.
+	 */
+	if (!keeper_config_set_backup_directory(config, -1))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_BAD_CONFIG);
+	}
 
 	/* set our configuration and state file pathnames */
 	if (!SetConfigFilePath(&(config->pathnames), config->pgSetup.pgdata))
@@ -256,11 +356,31 @@ keeper_config_init(KeeperConfig *config,
  */
 bool
 keeper_config_read_file(KeeperConfig *config,
-						bool missing_pgdata_is_ok,
-						bool pg_not_running_is_ok)
+						bool missingPgdataIsOk,
+						bool pgIsNotRunningIsOk,
+						bool monitorDisabledIsOk)
+{
+	if (!keeper_config_read_file_skip_pgsetup(config, monitorDisabledIsOk))
+	{
+		/* errors have already been logged. */
+		return false;
+	}
+
+	return keeper_config_pgsetup_init(config,
+									  missingPgdataIsOk,
+									  pgIsNotRunningIsOk);
+}
+
+
+/*
+ * keeper_config_read_file_skip_pgsetup overrides values in given KeeperConfig
+ * with whatever values are read from given configuration filename.
+ */
+bool
+keeper_config_read_file_skip_pgsetup(KeeperConfig *config,
+									 bool monitorDisabledIsOk)
 {
 	const char *filename = config->pathnames.config;
-	PostgresSetup pgSetup = { 0 };
 	IniOption keeperOptions[] = SET_INI_OPTIONS_ARRAY(config);
 
 	log_debug("Reading configuration from %s", filename);
@@ -271,16 +391,114 @@ keeper_config_read_file(KeeperConfig *config,
 		return false;
 	}
 
+	/*
+	 * We have changed the --nodename option to being named --hostname, and
+	 * same in the configuration file: pg_autoctl.nodename is now
+	 * pg_autoctl.hostname.
+	 *
+	 * We can read either names from the configuration file and will then write
+	 * the current option name (pg_autoctl.hostname), but we can't have either
+	 * one be required anymore.
+	 *
+	 * Implement the "require" property here by making sure one of those names
+	 * have been used to populate the monitor config structure.
+	 */
+	if (IS_EMPTY_STRING_BUFFER(config->hostname))
+	{
+		log_error("Failed to read either pg_autoctl.hostname or its older "
+				  "name pg_autoctl.nodename from the \"%s\" configuration file",
+				  filename);
+		return false;
+	}
+
+	/* take care of the special value for disabled monitor setup */
+	if (PG_AUTOCTL_MONITOR_IS_DISABLED(config))
+	{
+		config->monitorDisabled = true;
+
+		if (!monitorDisabledIsOk)
+		{
+			log_error("Monitor is disabled in the configuration");
+			return false;
+		}
+	}
+
+	/*
+	 * Turn the configuration string for hbaLevel into our enum value.
+	 */
+	if (!keeper_config_init_hbalevel(config))
+	{
+		log_error("Failed to initialize postgresql.hba_level");
+		return false;
+	}
+
+	/* set the ENUM value for hbaLevel */
+	config->pgSetup.hbaLevel =
+		pgsetup_parse_hba_level(config->pgSetup.hbaLevelStr);
+
+	/*
+	 * Required for grandfathering old clusters that don't have sslmode
+	 * explicitely set
+	 */
+	if (IS_EMPTY_STRING_BUFFER(config->pgSetup.ssl.sslModeStr))
+	{
+		strlcpy(config->pgSetup.ssl.sslModeStr, "prefer", SSL_MODE_STRLEN);
+	}
+
+	/* set the ENUM value for sslMode */
+	config->pgSetup.ssl.sslMode =
+		pgsetup_parse_sslmode(config->pgSetup.ssl.sslModeStr);
+
+	/* now when that is provided, read the Citus Role and convert to enum */
+	if (IS_EMPTY_STRING_BUFFER(config->citusRoleStr))
+	{
+		config->citusRole = CITUS_ROLE_PRIMARY;
+	}
+	else
+	{
+		if (strcmp(config->citusRoleStr, "primary") == 0)
+		{
+			config->citusRole = CITUS_ROLE_PRIMARY;
+		}
+		else if (strcmp(config->citusRoleStr, "secondary") == 0)
+		{
+			config->citusRole = CITUS_ROLE_SECONDARY;
+		}
+		else
+		{
+			log_error("Failed to parse citus.role \"%s\": expected either "
+					  "\"primary\" or \"secondary\"", config->citusRoleStr);
+			return false;
+		}
+	}
+
 	if (!keeper_config_init_nodekind(config))
 	{
 		/* errors have already been logged. */
 		return false;
 	}
 
+	return true;
+}
+
+
+/*
+ * keeper_config_pgsetup_init overrides values in given KeeperConfig with
+ * whatever values are read from given configuration filename.
+ */
+bool
+keeper_config_pgsetup_init(KeeperConfig *config,
+						   bool missingPgdataIsOk,
+						   bool pgIsNotRunningIsOk)
+{
+	PostgresSetup pgSetup = { 0 };
+
+	log_trace("keeper_config_pgsetup_init");
+
 	if (!pg_setup_init(&pgSetup,
 					   &config->pgSetup,
-					   missing_pgdata_is_ok,
-					   pg_not_running_is_ok))
+					   missingPgdataIsOk,
+					   pgIsNotRunningIsOk))
 	{
 		return false;
 	}
@@ -289,7 +507,7 @@ keeper_config_read_file(KeeperConfig *config,
 	 * Keep the whole set of values discovered in pg_setup_init from the
 	 * configuration file
 	 */
-	memcpy(&(config->pgSetup), &pgSetup, sizeof(PostgresSetup));
+	config->pgSetup = pgSetup;
 
 	return true;
 }
@@ -303,19 +521,17 @@ bool
 keeper_config_write_file(KeeperConfig *config)
 {
 	const char *filePath = config->pathnames.config;
-	bool success = false;
-	FILE *fileStream = NULL;
 
 	log_trace("keeper_config_write_file \"%s\"", filePath);
 
-	fileStream = fopen(filePath, "w");
+	FILE *fileStream = fopen_with_umask(filePath, "w", FOPEN_FLAGS_W, 0644);
 	if (fileStream == NULL)
 	{
-		log_error("Failed to open file \"%s\": %s", filePath, strerror(errno));
+		/* errors have already been logged */
 		return false;
 	}
 
-	success = keeper_config_write(fileStream, config);
+	bool success = keeper_config_write(fileStream, config);
 
 	if (fclose(fileStream) == EOF)
 	{
@@ -340,6 +556,21 @@ keeper_config_write(FILE *stream, KeeperConfig *config)
 
 
 /*
+ * keeper_config_to_json populates given jsRoot object with the INI
+ * configuration sections as JSON objects, and the options as keys to those
+ * objects.
+ */
+bool
+keeper_config_to_json(KeeperConfig *config, JSON_Value *js)
+{
+	JSON_Object *jsRoot = json_value_get_object(js);
+	IniOption keeperOptions[] = SET_INI_OPTIONS_ARRAY(config);
+
+	return ini_to_json(jsRoot, keeperOptions);
+}
+
+
+/*
  * keeper_config_log_settings outputs a DEBUG line per each config parameter in
  * the given KeeperConfig.
  */
@@ -349,7 +580,7 @@ keeper_config_log_settings(KeeperConfig config)
 	log_debug("pg_autoctl.monitor: %s", config.monitor_pguri);
 	log_debug("pg_autoctl.formation: %s", config.formation);
 
-	log_debug("postgresql.nodename: %s", config.nodename);
+	log_debug("postgresql.hostname: %s", config.hostname);
 	log_debug("postgresql.nodekind: %s", config.nodeKind);
 	log_debug("postgresql.pgdata: %s", config.pgSetup.pgdata);
 	log_debug("postgresql.pg_ctl: %s", config.pgSetup.pg_ctl);
@@ -359,8 +590,6 @@ keeper_config_log_settings(KeeperConfig config)
 	log_debug("postgresql.host: %s", config.pgSetup.pghost);
 	log_debug("postgresql.port: %d", config.pgSetup.pgport);
 
-	log_debug("replication.replication_slot_name: %s",
-			  config.replication_slot_name);
 	log_debug("replication.replication_password: %s",
 			  config.replication_password);
 	log_debug("replication.maximum_backup_rate: %s",
@@ -398,6 +627,8 @@ keeper_config_set_setting(KeeperConfig *config,
 	const char *filename = config->pathnames.config;
 	IniOption keeperOptions[] = SET_INI_OPTIONS_ARRAY(config);
 
+	log_trace("keeper_config_set_setting: %s = %s", path, value);
+
 	if (ini_set_setting(filename, keeperOptions, path, value))
 	{
 		PostgresSetup pgSetup = { 0 };
@@ -414,7 +645,7 @@ keeper_config_set_setting(KeeperConfig *config,
 						  missing_pgdata_is_ok,
 						  pg_is_not_running_is_ok))
 		{
-			memcpy(&(config->pgSetup), &pgSetup, sizeof(PostgresSetup));
+			config->pgSetup = pgSetup;
 			return true;
 		}
 	}
@@ -433,6 +664,8 @@ keeper_config_merge_options(KeeperConfig *config, KeeperConfig *options)
 {
 	IniOption keeperConfigOptions[] = SET_INI_OPTIONS_ARRAY(config);
 	IniOption keeperOptionsOptions[] = SET_INI_OPTIONS_ARRAY(options);
+
+	log_trace("keeper_config_merge_options");
 
 	if (ini_merge(keeperConfigOptions, keeperOptionsOptions))
 	{
@@ -457,7 +690,7 @@ keeper_config_merge_options(KeeperConfig *config, KeeperConfig *options)
 		 * Keep the whole set of values discovered in pg_setup_init from the
 		 * configuration file
 		 */
-		memcpy(&(config->pgSetup), &pgSetup, sizeof(PostgresSetup));
+		config->pgSetup = pgSetup;
 
 		return keeper_config_write_file(config);
 	}
@@ -466,222 +699,34 @@ keeper_config_merge_options(KeeperConfig *config, KeeperConfig *options)
 
 
 /*
- * keeper_config_set_groupId sets the groupId in the configuration file.
+ * keeper_config_update updates the configuration of the keeper once we are
+ * registered and know our nodeId and group: then we can also set our
+ * replication slot name and our backup directory using the nodeId.
  */
 bool
-keeper_config_set_groupId(KeeperConfig *config, int groupId)
+keeper_config_update(KeeperConfig *config, int nodeId, int groupId)
 {
-	IniOption *option;
-	IniOption keeperOptions[] = SET_INI_OPTIONS_ARRAY(config);
+	config->groupId = groupId;
 
-	option = lookup_ini_option(keeperOptions, "pg_autoctl", "group");
+	(void) postgres_sprintf_replicationSlotName(
+		nodeId,
+		config->replication_slot_name,
+		sizeof(config->replication_slot_name));
 
-	if (option == NULL)
+	/*
+	 * Compute the backupDirectory from pgdata, or check the one given in the
+	 * configuration file already.
+	 */
+	if (!keeper_config_set_backup_directory(config, nodeId))
 	{
-		log_error(
-			"BUG: keeper_config_set_groupId: lookup failed for pg_autoctl.group");
+		/* errors have already been logged */
 		return false;
 	}
 
-	*(option->intValue) = groupId;
+	log_debug("keeper_config_update: backup directory = %s",
+			  config->backupDirectory);
 
 	return keeper_config_write_file(config);
-}
-
-
-/*
- * keeper_config_destroy frees memory that may be dynamically allocated.
- */
-void
-keeper_config_destroy(KeeperConfig *config)
-{
-	if (config->replication_slot_name != NULL)
-	{
-		free(config->replication_slot_name);
-	}
-
-	if (config->maximum_backup_rate != NULL)
-	{
-		free(config->maximum_backup_rate);
-	}
-
-	if (config->replication_password != NULL)
-	{
-		free(config->replication_password);
-	}
-}
-
-
-/*
- * keeper_config_accept_new returns true when we can accept to RELOAD our
- * current config into the new one that's been editing.
- */
-#define strneq(x, y) \
-	((x != NULL) && (y != NULL) && ( strcmp(x, y) != 0))
-
-bool
-keeper_config_accept_new(KeeperConfig *config, KeeperConfig *newConfig)
-{
-	/* some elements are not supposed to change on a reload */
-	if (strneq(newConfig->pgSetup.pgdata, config->pgSetup.pgdata))
-	{
-		log_error("Attempt to change postgresql.pgdata from \"%s\" to \"%s\"",
-				  config->pgSetup.pgdata, newConfig->pgSetup.pgdata);
-		return false;
-	}
-
-	if (strneq(newConfig->replication_slot_name, config->replication_slot_name))
-	{
-		log_error("Attempt to change replication.slot from \"%s\" to \"%s\"",
-				  config->replication_slot_name,
-				  newConfig->replication_slot_name);
-		return false;
-	}
-
-	/*
-	 * Changing the monitor URI. Well it might just be about using a new IP
-	 * address, e.g. switching to IPv6, or maybe the monitor has moved to
-	 * another hostname.
-	 *
-	 * We don't check if we are still registered on the new monitor, only that
-	 * we can connect. The node_active calls are going to fail it we then
-	 * aren't registered anymore.
-	 */
-	if (strneq(newConfig->monitor_pguri, config->monitor_pguri))
-	{
-		Monitor monitor = { 0 };
-
-		if (!monitor_init(&monitor, newConfig->monitor_pguri))
-		{
-			log_fatal("Failed to contact the monitor because its URL is invalid, "
-					  "see above for details");
-			return false;
-		}
-
-		strlcpy(config->monitor_pguri, newConfig->monitor_pguri, MAXCONNINFO);
-	}
-
-	/*
-	 * We don't support changing formation, group, or nodename mid-flight: we
-	 * might have to register again to the monitor to make that work, and in
-	 * that case an admin should certainly be doing some offline steps, maybe
-	 * even having to `pg_autoctl create` all over again.
-	 */
-	if (strneq(newConfig->formation, config->formation))
-	{
-		log_warn("pg_autoctl doesn't know how to change formation at run-time, "
-				 "continuing with formation \"%s\".",
-				 config->formation);
-	}
-
-	/*
-	 * Changing the nodename seems ok, our registration is checked against
-	 * formation/groupId/nodeId anyway. The nodename is used so that other
-	 * nodes in the network may contact us. Again, it might be a change of
-	 * public IP address, e.g. switching to IPv6.
-	 */
-	if (strneq(newConfig->nodename, config->nodename))
-	{
-		log_info("Reloading configuration: nodename is now \"%s\"; "
-				 "used to be \"%s\"",
-				 newConfig->nodename, config->nodename);
-		strlcpy(config->nodename, newConfig->nodename, _POSIX_HOST_NAME_MAX);
-	}
-
-	/*
-	 * Changing the replication password? Sure.
-	 */
-	if (strneq(newConfig->replication_password, config->replication_password))
-	{
-		log_info("Reloading configuration: replication password has changed");
-
-		/* note: strneq checks args are not NULL, it's safe to proceed */
-		free(config->replication_password);
-		config->replication_password = strdup(newConfig->replication_password);
-	}
-
-	/*
-	 * Changing replication.maximum_backup_rate.
-	 */
-	if (strneq(newConfig->maximum_backup_rate, config->maximum_backup_rate))
-	{
-		log_info("Reloading configuration: "
-				 "replication.maximum_backup_rate is now \"%s\"; "
-				 "used to be \"%s\"" ,
-				 newConfig->maximum_backup_rate, config->maximum_backup_rate);
-
-		/* note: strneq checks args are not NULL, it's safe to proceed */
-		free(config->maximum_backup_rate);
-		config->maximum_backup_rate = strdup(newConfig->maximum_backup_rate);
-	}
-
-	/*
-	 * And now the timeouts. Of course we support changing them at run-time.
-	 */
-	if (newConfig->network_partition_timeout
-		!= config->network_partition_timeout)
-	{
-		log_info("Reloading configuration: timeout.network_partition_timeout "
-				 "is now %d; used to be %d",
-				 newConfig->network_partition_timeout,
-				 config->network_partition_timeout);
-
-		config->network_partition_timeout =
-			newConfig->network_partition_timeout;
-	}
-
-	if (newConfig->prepare_promotion_catchup
-		!= config->prepare_promotion_catchup)
-	{
-		log_info("Reloading configuration: timeout.prepare_promotion_catchup "
-				 "is now %d; used to be %d",
-				 newConfig->prepare_promotion_catchup,
-				 config->prepare_promotion_catchup);
-
-		config->prepare_promotion_catchup =
-			newConfig->prepare_promotion_catchup;
-	}
-
-	if (newConfig->prepare_promotion_walreceiver
-		!= config->prepare_promotion_walreceiver)
-	{
-		log_info(
-			"Reloading configuration: timeout.prepare_promotion_walreceiver "
-			"is now %d; used to be %d",
-			newConfig->prepare_promotion_walreceiver,
-			config->prepare_promotion_walreceiver);
-
-		config->prepare_promotion_walreceiver =
-			newConfig->prepare_promotion_walreceiver;
-	}
-
-	if (newConfig->postgresql_restart_failure_timeout
-		!= config->postgresql_restart_failure_timeout)
-	{
-		log_info(
-			"Reloading configuration: timeout.postgresql_restart_failure_timeout "
-			"is now %d; used to be %d",
-			newConfig->postgresql_restart_failure_timeout,
-			config->postgresql_restart_failure_timeout);
-
-		config->postgresql_restart_failure_timeout =
-			newConfig->postgresql_restart_failure_timeout;
-	}
-
-	if (newConfig->postgresql_restart_failure_max_retries
-		!= config->postgresql_restart_failure_max_retries)
-	{
-		log_info(
-			"Reloading configuration: retries.postgresql_restart_failure_max_retries "
-			"is now %d; used to be %d",
-			newConfig->postgresql_restart_failure_max_retries,
-			config->postgresql_restart_failure_max_retries);
-
-		config->postgresql_restart_failure_max_retries =
-			newConfig->postgresql_restart_failure_max_retries;
-	}
-
-	return true;
 }
 
 
@@ -725,8 +770,111 @@ keeper_config_init_nodekind(KeeperConfig *config)
 
 
 /*
- * keeper_config_update_with_absolute_pgdata verifies that the pgdata path is an absolute one
- * If not, the config->pgSetup is updated and we rewrite the config file
+ * keeper_config_init_hbalevel initializes the config->pgSetup.hbaLevel and
+ * hbaLevelStr when no command line option switch has been used that places a
+ * value (see --auth, --skip-pg-hba, and --pg-hba-lan).
+ */
+static bool
+keeper_config_init_hbalevel(KeeperConfig *config)
+{
+	/*
+	 * Turn the configuration string for hbaLevel into our enum value.
+	 */
+	if (IS_EMPTY_STRING_BUFFER(config->pgSetup.hbaLevelStr))
+	{
+		strlcpy(config->pgSetup.hbaLevelStr, "minimal", NAMEDATALEN);
+	}
+
+	/* set the ENUM value for hbaLevel */
+	config->pgSetup.hbaLevel =
+		pgsetup_parse_hba_level(config->pgSetup.hbaLevelStr);
+
+	return true;
+}
+
+
+/*
+ * keeper_config_set_backup_directory sets the pg_basebackup target directory
+ * to ${PGDATA}/../backup/${hostname} by default. Adding the local hostname
+ * makes it possible to run several instances of Postgres and pg_autoctl on the
+ * same host, which is nice for development and testing scenarios.
+ *
+ * That said, when testing and maybe in other situations, it is custom to have
+ * all the nodes sit on the same machine, and all be "localhost". To avoid any
+ * double-usage of the backup directory, as soon as we have a nodeId we use
+ * ${PGDATA/../backup/node_${nodeId} instead.
+ */
+static bool
+keeper_config_set_backup_directory(KeeperConfig *config, int nodeId)
+{
+	char *pgdata = config->pgSetup.pgdata;
+	char subdirs[MAXPGPATH] = { 0 };
+	char backupDirectory[MAXPGPATH] = { 0 };
+	char absoluteBackupDirectory[PATH_MAX];
+
+	/* build the default hostname based backup directory path */
+	sformat(subdirs, MAXPGPATH, "backup/%s", config->hostname);
+	path_in_same_directory(pgdata, subdirs, backupDirectory);
+
+	/*
+	 * If the user didn't provide a backupDirectory and we're not registered
+	 * yet, just use the default value with the hostname. Don't even check it
+	 * now.
+	 */
+	if (IS_EMPTY_STRING_BUFFER(config->backupDirectory) && nodeId <= 0)
+	{
+		strlcpy(config->backupDirectory, backupDirectory, MAXPGPATH);
+		return true;
+	}
+
+	/* if we didn't have a backup directory yet, set one */
+	if (IS_EMPTY_STRING_BUFFER(config->backupDirectory) ||
+		strcmp(backupDirectory, config->backupDirectory) == 0)
+	{
+		/* we might be able to use the nodeId, better than the hostname */
+		if (nodeId > 0)
+		{
+			sformat(subdirs, MAXPGPATH, "backup/node_%d", nodeId);
+			path_in_same_directory(pgdata, subdirs, backupDirectory);
+		}
+
+		strlcpy(config->backupDirectory, backupDirectory, MAXPGPATH);
+	}
+
+	/*
+	 * The best way to make sure we are allowed to create the backup directory
+	 * is to just go ahead and create it now.
+	 */
+	log_debug("mkdir -p \"%s\"", config->backupDirectory);
+	if (!ensure_empty_dir(config->backupDirectory, 0700))
+	{
+		log_fatal("Failed to create the backup directory \"%s\", "
+				  "see above for details", config->backupDirectory);
+		return false;
+	}
+
+	/* Now get the realpath() of the directory we just created */
+	if (!realpath(config->backupDirectory, absoluteBackupDirectory))
+	{
+		/* non-fatal error, just keep the computed or given directory path */
+		log_warn("Failed to get the realpath of backup directory \"%s\": %m",
+				 config->backupDirectory);
+		return true;
+	}
+
+	if (strcmp(config->backupDirectory, absoluteBackupDirectory) != 0)
+	{
+		strlcpy(config->backupDirectory, absoluteBackupDirectory, MAXPGPATH);
+	}
+
+	return true;
+}
+
+
+/*
+ * keeper_config_update_with_absolute_pgdata verifies that the pgdata path is
+ * an absolute one If not, the config->pgSetup is updated and we rewrite the
+ * config file
  */
 bool
 keeper_config_update_with_absolute_pgdata(KeeperConfig *config)

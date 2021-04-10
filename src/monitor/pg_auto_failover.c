@@ -46,7 +46,7 @@ static void pgautofailover_ProcessUtility(PlannedStmt *pstmt,
 										  ParamListInfo params,
 										  struct QueryEnvironment *queryEnv,
 										  DestReceiver *dest,
-										  char *completionTag);
+										  QueryCompletion *completionTag);
 
 
 PG_MODULE_MAGIC;
@@ -60,7 +60,10 @@ _PG_init(void)
 {
 	if (!process_shared_preload_libraries_in_progress)
 	{
-		return;
+		ereport(ERROR,
+				(errmsg("pgautofailover can only be loaded via shared_preload_libraries"),
+				 errhint("Add pgautofailover to shared_preload_libraries "
+						 "configuration variable in postgresql.conf.")));
 	}
 
 	StartMonitorNode();
@@ -88,7 +91,7 @@ StartMonitorNode(void)
 
 	DefineCustomIntVariable("pgautofailover.health_check_period",
 							"Duration between each check (in milliseconds).",
-							NULL, &HealthCheckPeriod, 20 * 1000, 1, INT_MAX, PGC_SIGHUP,
+							NULL, &HealthCheckPeriod, 5 * 1000, 1, INT_MAX, PGC_SIGHUP,
 							GUC_UNIT_MS, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pgautofailover.health_check_timeout",
@@ -144,9 +147,10 @@ StartMonitorNode(void)
 	worker.bgw_restart_time = 1;
 	worker.bgw_main_arg = Int32GetDatum(0);
 	worker.bgw_notify_pid = 0;
-	sprintf(worker.bgw_library_name, "pgautofailover");
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_auto_failover monitor");
-	sprintf(worker.bgw_function_name, "HealthCheckWorkerLauncherMain");
+	strlcpy(worker.bgw_library_name, "pgautofailover", sizeof(worker.bgw_library_name));
+	strlcpy(worker.bgw_name, "pg_auto_failover monitor", sizeof(worker.bgw_name));
+	strlcpy(worker.bgw_function_name, "HealthCheckWorkerLauncherMain",
+			sizeof(worker.bgw_function_name));
 
 	RegisterBackgroundWorker(&worker);
 }
@@ -165,7 +169,7 @@ pgautofailover_ProcessUtility(PlannedStmt *pstmt,
 							  ParamListInfo params,
 							  struct QueryEnvironment *queryEnv,
 							  DestReceiver *dest,
-							  char *completionTag)
+							  QueryCompletion *completionTag)
 {
 	Node *parsetree = pstmt->utilityStmt;
 

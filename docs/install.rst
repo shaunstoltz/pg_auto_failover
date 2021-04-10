@@ -20,7 +20,7 @@ several steps. The full script is available for review at our `package cloud
 installation instructions`__ page.
 
 __ https://packagecloud.io/citusdata/community/install#bash
-  
+
 .. code-block:: bash
 
   # add the required packages to your system
@@ -55,7 +55,7 @@ itself as in the previous case:
 
   # confirm installation
   /usr/bin/pg_autoctl --version
-     
+
 Fedora, CentOS, or Red Hat
 --------------------------
 
@@ -66,7 +66,7 @@ The following installation method downloads a bash script that automates
 several steps. The full script is available for review at our `package cloud
 installation instructions page`__ url.
 
-__ https://packagecloud.io/citusdata/community/install#bash  
+__ https://packagecloud.io/citusdata/community/install#bash
 
 .. code-block:: bash
 
@@ -74,10 +74,10 @@ __ https://packagecloud.io/citusdata/community/install#bash
   curl https://install.citusdata.com/community/rpm.sh | sudo bash
 
   # install pg_auto_failover
-  sudo yum install -y pg-auto-failover10_11
+  sudo yum install -y pg-auto-failover14_12
 
   # confirm installation
-  /usr/pgsql-11/bin/pg_autoctl --version
+  /usr/pgsql-12/bin/pg_autoctl --version
 
 Manual installation
 ~~~~~~~~~~~~~~~~~~~
@@ -92,15 +92,15 @@ guide you with the specific details to achieve the 3 steps:
 
 Then when that's done, you can proceed with installing pg_auto_failover
 itself as in the previous case:
-     
+
 .. code-block:: bash
 
   # install pg_auto_failover
-  sudo yum install -y pg-auto-failover10_11
+  sudo yum install -y pg-auto-failover14_12
 
   # confirm installation
-  /usr/pgsql-11/bin/pg_autoctl --version
-     
+  /usr/pgsql-12/bin/pg_autoctl --version
+
 __ https://packagecloud.io/citusdata/community/install#manual-rpm
 
 Installing a pgautofailover Systemd unit
@@ -112,7 +112,7 @@ machine.
 
 Here's a sample output from the command:
 
-.. code-block::
+.. code-block:: bash
 
    $ export PGDATA=/var/lib/postgresql/monitor
    $ pg_autoctl show systemd
@@ -122,18 +122,18 @@ Here's a sample output from the command:
    13:44:34 INFO  sudo systemctl start pgautofailover
    [Unit]
    Description = pg_auto_failover
-   
+
    [Service]
-   WorkingDirectory = /var/lib/postgresql/monitor
+   WorkingDirectory = /var/lib/postgresql
    Environment = 'PGDATA=/var/lib/postgresql/monitor'
    User = postgres
    ExecStart = /usr/lib/postgresql/10/bin/pg_autoctl run
    Restart = always
    StartLimitBurst = 0
-   
+
    [Install]
    WantedBy = multi-user.target
-   
+
 Copy/pasting the commands given in the hint output from the command will
 enable the pgautofailer service on your system, when using systemd.
 

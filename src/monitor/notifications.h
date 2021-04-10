@@ -31,29 +31,13 @@
  *   the chatter without having to actually have the privileges to tail the
  *   PostgreSQL server logs.
  */
-#define CHANNEL_STATE		"state"
-#define CHANNEL_LOG			"log"
-#define BUFSIZE				8192
+#define CHANNEL_STATE "state"
+#define CHANNEL_LOG "log"
+#define BUFSIZE 8192
 
 
-void LogAndNotifyMessage(char *message, size_t size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+void LogAndNotifyMessage(char *message, size_t size, const char *fmt, ...) __attribute__(
+	(format(printf, 3, 4)));
 
-
-int64 NotifyStateChange(ReplicationState reportedState,
-						ReplicationState goalState,
-						const char *formationId,
-						int groupId,
-						int64 nodeId,
-						const char *nodeName,
-						int nodePort,
-						SyncState pgsrSyncState,
-						int64 xlogDelta,
-						char *description);
-
-int64 InsertEvent(const char *formationId, int groupId, int64 nodeId,
-				  const char *nodeName, int nodePort,
-				  ReplicationState reportedState,
-				  ReplicationState goalState,
-				  SyncState pgsrSyncState,
-				  int64 xlogDelta,
-				  char *description);
+int64 NotifyStateChange(AutoFailoverNode *node, char *description);
+int64 InsertEvent(AutoFailoverNode *node, char *description);

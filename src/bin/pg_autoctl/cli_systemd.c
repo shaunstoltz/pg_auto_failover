@@ -18,6 +18,7 @@
 #include "cli_common.h"
 #include "cli_do_root.h"
 #include "commandline.h"
+#include "env_utils.h"
 #include "config.h"
 #include "defaults.h"
 #include "file_utils.h"
@@ -29,7 +30,6 @@ static SystemdServiceConfig systemdOptions;
 
 
 static int cli_systemd_getopt(int argc, char **argv);
-static void cli_systemd_enable_service(int argc, char **argv);
 static void cli_systemd_cat_service_file(int argc, char **argv);
 
 /* pg_autoctl show systemd, see cli_show.c */
@@ -49,16 +49,20 @@ cli_systemd_getopt(int argc, char **argv)
 	SystemdServiceConfig options = { 0 };
 
 	int c = 0, option_index = 0, errors = 0;
+	int verboseCount = 0;
 
 	static struct option long_options[] = {
 		{ "pgdata", required_argument, NULL, 'D' },
+		{ "version", no_argument, NULL, 'V' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "quiet", no_argument, NULL, 'q' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
 
 	optind = 0;
 
-	while ((c = getopt_long(argc, argv, "D:h",
+	while ((c = getopt_long(argc, argv, "D:Vvqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -70,22 +74,68 @@ cli_systemd_getopt(int argc, char **argv)
 				break;
 			}
 
+			case 'V':
+			{
+				/* keeper_cli_print_version prints version and exits. */
+				keeper_cli_print_version(argc, argv);
+				break;
+			}
+
+			case 'v':
+			{
+				++verboseCount;
+				switch (verboseCount)
+				{
+					case 1:
+					{
+						log_set_level(LOG_INFO);
+						break;
+					}
+
+					case 2:
+					{
+						log_set_level(LOG_DEBUG);
+						break;
+					}
+
+					default:
+					{
+						log_set_level(LOG_TRACE);
+						break;
+					}
+				}
+				break;
+			}
+
+			case 'q':
+			{
+				log_set_level(LOG_ERROR);
+				break;
+			}
+
+			case 'h':
+			{
+				commandline_help(stderr);
+				exit(EXIT_CODE_QUIT);
+				break;
+			}
+
+			default:
+			{
+				/* getopt_long already wrote an error message */
+				errors++;
+				break;
+			}
 		}
 	}
 
-	if (IS_EMPTY_STRING_BUFFER(options.pgSetup.pgdata))
+	if (errors > 0)
 	{
-		char *pgdata = getenv("PGDATA");
-
-		if (pgdata == NULL)
-		{
-			log_fatal("Failed to set PGDATA either from the environment "
-					  "or from --pgdata");
-			exit(EXIT_CODE_BAD_ARGS);
-		}
-
-		strlcpy(options.pgSetup.pgdata, pgdata, MAXPGPATH);
+		commandline_help(stderr);
+		exit(EXIT_CODE_BAD_ARGS);
 	}
+
+	cli_common_get_set_pgdata_or_exit(&(options.pgSetup));
 
 	if (!keeper_config_set_pathnames_from_pgdata(&options.pathnames,
 												 options.pgSetup.pgdata))
@@ -118,6 +168,7 @@ cli_systemd_cat_service_file(int argc, char **argv)
 	log_info("pg_autoctl -q show systemd --pgdata \"%s\" | sudo tee %s",
 			 config.pgSetup.pgdata, config.pathnames.systemd);
 	log_info("sudo systemctl daemon-reload");
+	log_info("sudo systemctl enable pgautofailover");
 	log_info("sudo systemctl start pgautofailover");
 
 	if (!systemd_config_write(stdout, &config))

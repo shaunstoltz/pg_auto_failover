@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "metadata.h"
+#include "node_metadata.h"
 #include "notifications.h"
 #include "replication_state.h"
 
@@ -22,6 +23,8 @@
 #include "executor/spi.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/json.h"
+#include "utils/pg_lsn.h"
 
 
 /*
@@ -31,11 +34,17 @@
 void
 LogAndNotifyMessage(char *message, size_t size, const char *fmt, ...)
 {
-	int n;
 	va_list args;
 
 	va_start(args, fmt);
-	n = vsnprintf(message, size-2, fmt, args);
+
+	/*
+	 * Explanation of IGNORE-BANNED
+	 * Arguments are always non-null and we
+	 * do not write before the allocated buffer.
+	 *
+	 */
+	int n = vsnprintf(message, size - 2, fmt, args); /* IGNORE-BANNED */
 	va_end(args);
 
 	if (n < 0)
@@ -46,8 +55,6 @@ LogAndNotifyMessage(char *message, size_t size, const char *fmt, ...)
 
 	ereport(LOG, (errmsg("%s", message)));
 	Async_Notify(CHANNEL_LOG, message);
-
-	return;
 }
 
 
@@ -57,46 +64,49 @@ LogAndNotifyMessage(char *message, size_t size, const char *fmt, ...)
  * as to be easy to parse by a machine.
  */
 int64
-NotifyStateChange(ReplicationState reportedState,
-				  ReplicationState goalState,
-				  const char *formationId,
-				  int groupId,
-				  int64 nodeId,
-				  const char *nodeName,
-				  int nodePort,
-				  SyncState pgsrSyncState,
-				  int64 xlogDelta,
-				  char *description)
+NotifyStateChange(AutoFailoverNode *node, char *description)
 {
-	int64 eventid;
-	char payload[BUFSIZE];
+	StringInfo payload = makeStringInfo();
 
 	/*
 	 * Insert the event in our events table.
 	 */
-	eventid = InsertEvent(formationId, groupId, nodeId, nodeName, nodePort,
-						  reportedState, goalState, pgsrSyncState, xlogDelta,
-						  description);
+	int64 eventid = InsertEvent(node, description);
 
-	/*
-	 * Rather than try and escape dots and colon characters from the user
-	 * provided strings formationId and nodeName, we include the length of the
-	 * string in the message. Parsing is then easier on the receiving side too.
-	 */
-	sprintf(payload,
-			"S:%s:%s:%lu.%s:%d:%ld:%lu.%s:%d",
-			ReplicationStateGetName(reportedState),
-			ReplicationStateGetName(goalState),
-			strlen(formationId),
-			formationId,
-			groupId,
-			nodeId,
-			strlen(nodeName),
-			nodeName,
-			nodePort);
+	/* build a json object from the notification pieces */
+	appendStringInfoChar(payload, '{');
 
-	Async_Notify(CHANNEL_STATE, payload);
+	appendStringInfo(payload, "\"type\": \"state\"");
 
+	appendStringInfo(payload, ", \"formation\": ");
+	escape_json(payload, node->formationId);
+
+	appendStringInfo(payload, ", \"groupId\": %d", node->groupId);
+	appendStringInfo(payload, ", \"nodeId\": %d", node->nodeId);
+
+	appendStringInfo(payload, ", \"name\": ");
+	escape_json(payload, node->nodeName);
+
+	appendStringInfo(payload, ", \"host\": ");
+	escape_json(payload, node->nodeHost);
+
+	appendStringInfo(payload, ", \"port\": %d", node->nodePort);
+
+	appendStringInfo(payload, ", \"reportedState\": ");
+	escape_json(payload, ReplicationStateGetName(node->reportedState));
+
+	appendStringInfo(payload, ", \"goalState\": ");
+	escape_json(payload, ReplicationStateGetName(node->goalState));
+
+	appendStringInfo(payload, ", \"health\":");
+	escape_json(payload, NodeHealthToString(node->health));
+
+	appendStringInfoChar(payload, '}');
+
+	Async_Notify(CHANNEL_STATE, payload->data);
+
+	pfree(payload->data);
+	pfree(payload);
 	return eventid;
 }
 
@@ -106,16 +116,10 @@ NotifyStateChange(ReplicationState reportedState,
  * entry, and returns the id of the new event.
  */
 int64
-InsertEvent(const char *formationId, int groupId, int64 nodeId,
-			const char *nodeName, int nodePort,
-			ReplicationState reportedState,
-			ReplicationState goalState,
-			SyncState pgsrSyncState,
-			int64 xlogDelta,
-			char *description)
+InsertEvent(AutoFailoverNode *node, char *description)
 {
-	Oid goalStateOid = ReplicationStateGetEnum(goalState);
-	Oid reportedStateOid = ReplicationStateGetEnum(reportedState);
+	Oid goalStateOid = ReplicationStateGetEnum(node->goalState);
+	Oid reportedStateOid = ReplicationStateGetEnum(node->reportedState);
 	Oid replicationStateTypeOid = ReplicationStateTypeOid();
 
 	Oid argTypes[] = {
@@ -123,51 +127,57 @@ InsertEvent(const char *formationId, int groupId, int64 nodeId,
 		INT8OID, /* nodeid */
 		INT4OID, /* groupid */
 		TEXTOID, /* nodename */
+		TEXTOID, /* nodehost */
 		INT4OID, /* nodeport */
 		replicationStateTypeOid, /* reportedstate */
 		replicationStateTypeOid, /* goalstate */
 		TEXTOID, /* pg_stat_replication.sync_state */
-		INT8OID, /* xlogdelta */
-		TEXTOID	 /* description */
+		LSNOID,  /* reportedLSN */
+		INT4OID, /* candidate_priority */
+		BOOLOID, /* replication_quorum */
+		TEXTOID  /* description */
 	};
 
 	Datum argValues[] = {
-		CStringGetTextDatum(formationId),	/* formationid */
-		Int64GetDatum(nodeId),				/* nodeid */
-		Int32GetDatum(groupId),				/* groupid */
-		CStringGetTextDatum(nodeName),		/* nodename */
-		Int32GetDatum(nodePort),			/* nodeport */
-		ObjectIdGetDatum(reportedStateOid),	/* reportedstate */
-		ObjectIdGetDatum(goalStateOid),		/* goalstate */
-		CStringGetTextDatum(SyncStateToString(pgsrSyncState)), /* sync_state */
-		Int64GetDatum(xlogDelta),			/* xlogDelta */
-		CStringGetTextDatum(description)	/* description */
+		CStringGetTextDatum(node->formationId),   /* formationid */
+		Int64GetDatum(node->nodeId),              /* nodeid */
+		Int32GetDatum(node->groupId),             /* groupid */
+		CStringGetTextDatum(node->nodeName),      /* nodename */
+		CStringGetTextDatum(node->nodeHost),      /* nodehost */
+		Int32GetDatum(node->nodePort),            /* nodeport */
+		ObjectIdGetDatum(reportedStateOid), /* reportedstate */
+		ObjectIdGetDatum(goalStateOid),     /* goalstate */
+		CStringGetTextDatum(SyncStateToString(node->pgsrSyncState)), /* sync_state */
+		LSNGetDatum(node->reportedLSN),           /* reportedLSN */
+		Int32GetDatum(node->candidatePriority),   /* candidate_priority */
+		BoolGetDatum(node->replicationQuorum),    /* replication_quorum */
+		CStringGetTextDatum(description)          /* description */
 	};
 
 	const int argCount = sizeof(argValues) / sizeof(argValues[0]);
-	int spiStatus = 0;
 	int64 eventId = 0;
 
 	const char *insertQuery =
 		"INSERT INTO " AUTO_FAILOVER_EVENT_TABLE
-		"(formationid, nodeid, groupid, nodename, nodeport,"
-		" reportedstate, goalstate, reportedrepstate, waldelta, description) "
-		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING eventid";
+		"(formationid, nodeid, groupid, nodename, nodehost, nodeport,"
+		" reportedstate, goalstate, reportedrepstate, reportedlsn,"
+		" candidatepriority, replicationquorum, description) "
+		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) "
+		"RETURNING eventid";
 
 	SPI_connect();
 
-	spiStatus = SPI_execute_with_args(insertQuery, argCount, argTypes,
-									  argValues, NULL, false, 0);
+	int spiStatus = SPI_execute_with_args(insertQuery, argCount, argTypes,
+										  argValues, NULL, false, 0);
 
 	if (spiStatus == SPI_OK_INSERT_RETURNING && SPI_processed > 0)
 	{
 		bool isNull = false;
-		Datum eventIdDatum = 0;
 
-		eventIdDatum = SPI_getbinval(SPI_tuptable->vals[0],
-									 SPI_tuptable->tupdesc,
-									 1,
-									 &isNull);
+		Datum eventIdDatum = SPI_getbinval(SPI_tuptable->vals[0],
+										   SPI_tuptable->tupdesc,
+										   1,
+										   &isNull);
 
 		eventId = DatumGetInt64(eventIdDatum);
 	}
