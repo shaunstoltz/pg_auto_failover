@@ -30,6 +30,7 @@
 #define ERRCODE_INVALID_OBJECT_DEFINITION "42P17"
 #define ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE "55000"
 #define ERRCODE_OBJECT_IN_USE "55006"
+#define ERRCODE_UNDEFINED_OBJECT "42704"
 
 static char * ConnectionTypeToString(ConnectionType connectionType);
 static void log_connection_error(PGconn *connection, int logLevel);
@@ -47,7 +48,8 @@ static void parsePgMetadata(void *ctx, PGresult *result);
 static void parsePgReachedTargetLSN(void *ctx, PGresult *result);
 static void parseReplicationSlotMaintain(void *ctx, PGresult *result);
 static void parsePgReachedTargetLSN(void *ctx, PGresult *result);
-static void parseIdentifySystem(void *ctx, PGresult *result);
+static void parseIdentifySystemResult(void *ctx, PGresult *result);
+static void parseTimelineHistoryResult(void *ctx, PGresult *result);
 
 
 /*
@@ -60,7 +62,9 @@ parseSingleValueResult(void *ctx, PGresult *result)
 {
 	SingleValueResultContext *context = (SingleValueResultContext *) ctx;
 
-	if (PQntuples(result) == 1)
+	context->ntuples = PQntuples(result);
+
+	if (context->ntuples == 1)
 	{
 		char *value = PQgetvalue(result, 0, 0);
 
@@ -408,9 +412,21 @@ pgsql_finish(PGSQL *pgsql)
 {
 	if (pgsql->connection != NULL)
 	{
+		char scrubbedConnectionString[MAXCONNINFO] = { 0 };
+
+		if (!parse_and_scrub_connection_string(pgsql->connectionString,
+											   scrubbedConnectionString))
+		{
+			log_debug("Failed to scrub password from connection string");
+
+			strlcpy(scrubbedConnectionString,
+					pgsql->connectionString,
+					sizeof(scrubbedConnectionString));
+		}
+
 		log_debug("Disconnecting from [%s] \"%s\"",
 				  ConnectionTypeToString(pgsql->connectionType),
-				  pgsql->connectionString);
+				  scrubbedConnectionString);
 		PQfinish(pgsql->connection);
 		pgsql->connection = NULL;
 
@@ -462,7 +478,7 @@ log_connection_error(PGconn *connection, int logLevel)
 /*
  * pgsql_open_connection opens a PostgreSQL connection, given a PGSQL client
  * instance. If a connection is already open in the client (it's not NULL),
- * then pgsql_open_connection reuses it and returns it immediately.
+ * then this errors, unless we are inside a transaction opened by pgsql_begin.
  */
 static PGconn *
 pgsql_open_connection(PGSQL *pgsql)
@@ -480,9 +496,14 @@ pgsql_open_connection(PGSQL *pgsql)
 		return pgsql->connection;
 	}
 
+	char scrubbedConnectionString[MAXCONNINFO] = { 0 };
+
+	(void) parse_and_scrub_connection_string(pgsql->connectionString,
+											 scrubbedConnectionString);
+
 	log_debug("Connecting to [%s] \"%s\"",
 			  ConnectionTypeToString(pgsql->connectionType),
-			  pgsql->connectionString);
+			  scrubbedConnectionString);
 
 	/* we implement our own retry strategy */
 	setenv("PGCONNECT_TIMEOUT", POSTGRES_CONNECT_TIMEOUT, 1);
@@ -573,8 +594,13 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 
 	INSTR_TIME_SET_ZERO(lastWarningTime);
 
+	char scrubbedConnectionString[MAXCONNINFO] = { 0 };
+
+	(void) parse_and_scrub_connection_string(pgsql->connectionString,
+											 scrubbedConnectionString);
+
 	log_warn("Failed to connect to \"%s\", retrying until "
-			 "the server is ready", pgsql->connectionString);
+			 "the server is ready", scrubbedConnectionString);
 
 	/* should not happen */
 	if (pgsql->retryPolicy.maxR == 0)
@@ -601,7 +627,7 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 			log_error("Failed to connect to \"%s\" "
 					  "after %d attempts in %d ms, "
 					  "pg_autoctl stops retrying now",
-					  pgsql->connectionString,
+					  scrubbedConnectionString,
 					  pgsql->retryPolicy.attempts,
 					  (int) INSTR_TIME_GET_MILLISEC(duration));
 
@@ -619,7 +645,7 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 		(void) pg_usleep(sleep * 1000);
 
 		log_debug("PQping(%s): slept %d ms on attempt %d",
-				  pgsql->connectionString,
+				  scrubbedConnectionString,
 				  pgsql->retryPolicy.sleepTime,
 				  pgsql->retryPolicy.attempts);
 
@@ -659,7 +685,7 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 
 					log_info("Successfully connected to \"%s\" "
 							 "after %d attempts in %d ms.",
-							 pgsql->connectionString,
+							 scrubbedConnectionString,
 							 pgsql->retryPolicy.attempts,
 							 (int) INSTR_TIME_GET_MILLISEC(duration));
 				}
@@ -713,7 +739,7 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 						"The server at \"%s\" is running but is in a state "
 						"that disallows connections (startup, shutdown, or "
 						"crash recovery).",
-						pgsql->connectionString);
+						scrubbedConnectionString);
 				}
 
 				break;
@@ -756,7 +782,7 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 						"number), or that there is a network connectivity "
 						"problem (for example, a firewall blocking the "
 						"connection request).",
-						pgsql->connectionString,
+						scrubbedConnectionString,
 						pgsql->retryPolicy.attempts,
 						(int) INSTR_TIME_GET_MILLISEC(durationSinceStart));
 				}
@@ -776,7 +802,7 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 				lastWarningMessage = PQPING_NO_ATTEMPT;
 				log_debug("Failed to ping server \"%s\" because of "
 						  "client-side problems (no attempt were made)",
-						  pgsql->connectionString);
+						  scrubbedConnectionString);
 				break;
 			}
 		}
@@ -847,17 +873,25 @@ pgAutoCtlDebugNoticeProcessor(void *arg, const char *message)
 bool
 pgsql_begin(PGSQL *pgsql)
 {
-	PGconn *connection;
-
+	/*
+	 * Indicate that we're running a transaction, so that the connection is not
+	 * closed after each query automatically. It also allows us to detect bugs
+	 * easily. We need to do this before executing BEGIN, because otherwise the
+	 * connection is closed after the BEGIN statement automatically.
+	 */
 	pgsql->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
-	connection = pgsql_open_connection(pgsql);
-	if (connection == NULL)
+
+	if (!pgsql_execute(pgsql, "BEGIN"))
 	{
-		/* error message was logged in pgsql_open_connection */
+		/*
+		 * We need to manually call pgsql_finish to clean up here in case of
+		 * this failure, because we have set the statement type to MULTI.
+		 */
+		pgsql_finish(pgsql);
 		return false;
 	}
 
-	return pgsql_execute(pgsql, "BEGIN");
+	return true;
 }
 
 
@@ -1043,9 +1077,11 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 		 * with a badly formed SQL query etc.
 		 */
 		if (pgsql->connectionType == PGSQL_CONN_MONITOR &&
+			sqlstate != NULL &&
 			!(strcmp(sqlstate, ERRCODE_INVALID_OBJECT_DEFINITION) == 0 ||
 			  strcmp(sqlstate, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE) == 0 ||
-			  strcmp(sqlstate, ERRCODE_OBJECT_IN_USE)))
+			  strcmp(sqlstate, ERRCODE_OBJECT_IN_USE) == 0 ||
+			  strcmp(sqlstate, ERRCODE_UNDEFINED_OBJECT) == 0))
 		{
 			log_error("SQL query: %s", sql);
 			log_error("SQL params: %s", debugParameters);
@@ -1073,7 +1109,16 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 
 		PQclear(result);
 		clear_results(pgsql);
-		pgsql_finish(pgsql);
+
+		/*
+		 * Multi statements might want to ROLLBACK and hold to the open
+		 * connection for a retry step.
+		 */
+		if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
+		{
+			PQfinish(pgsql->connection);
+			pgsql->connection = NULL;
+		}
 
 		return false;
 	}
@@ -1303,10 +1348,12 @@ pgsql_check_monitor_settings(PGSQL *pgsql, bool *settings_are_ok)
  * for given nodeId in the given slotName buffer of given size.
  */
 bool
-postgres_sprintf_replicationSlotName(int nodeId, char *slotName, int size)
+postgres_sprintf_replicationSlotName(int64_t nodeId, char *slotName, int size)
 {
 	int bytesWritten =
-		sformat(slotName, size, "%s_%d", REPLICATION_SLOT_NAME_DEFAULT, nodeId);
+		sformat(slotName, size, "%s_%" PRId64,
+				REPLICATION_SLOT_NAME_DEFAULT,
+				nodeId);
 
 	return bytesWritten <= size;
 }
@@ -1330,7 +1377,7 @@ pgsql_set_synchronous_standby_names(PGSQL *pgsql,
 				  "requires %lu bytes",
 				  synchronous_standby_names,
 				  BUFSIZE,
-				  strlen(synchronous_standby_names));
+				  (unsigned long) strlen(synchronous_standby_names));
 		return false;
 	}
 
@@ -1460,15 +1507,46 @@ pgsql_drop_replication_slot(PGSQL *pgsql, const char *slotName)
  * We return how many parameters we filled in paramTypes and paramValues from
  * the nodeArray.
  */
-static int
-BuildNodesArrayValues(NodeAddressArray *nodeArray,
-					  Oid *paramTypes, char **paramValues,
-					  char *values, int size)
+#define NODEID_MAX_LENGTH 20    /* should allow for bigint digits */
+
+typedef struct nodesArraysValuesParams
 {
-	char buffer[BUFSIZE];
+	int count;
+	Oid types[NODE_ARRAY_MAX_COUNT * 2];
+	char *values[NODE_ARRAY_MAX_COUNT * 2];
+
+	/*
+	 * Pre-allocate arrays for the data separately from the values array, which
+	 * needs to be a (const char **) thing rather than a (char [][]) thing,
+	 * because of the pgsql_execute_with_params and libpq APIs.
+	 */
+	char nodeIds[NODE_ARRAY_MAX_COUNT][NODEID_MAX_LENGTH];
+	char lsns[NODE_ARRAY_MAX_COUNT][PG_LSN_MAXLENGTH];
+} nodesArraysValuesParams;
+
+
+static bool
+BuildNodesArrayValues(NodeAddressArray *nodeArray,
+					  nodesArraysValuesParams *sqlParams,
+					  PQExpBuffer values)
+{
 	int nodeIndex = 0;
 	int paramIndex = 0;
-	int valuesIndex = 0;
+
+	/* when we didn't find any node to process, return our empty set */
+	if (nodeArray->count == 0)
+	{
+		appendPQExpBufferStr(
+			values,
+			"SELECT id, lsn "
+			"FROM (values (null::int, null::pg_lsn)) as t(id, lsn) "
+			"where false");
+
+		return true;
+	}
+
+	/* we start the VALUES subquery with the values SQL keyword */
+	appendPQExpBufferStr(values, "values ");
 
 	/*
 	 * Build a SQL VALUES statement for every other node registered in the
@@ -1478,61 +1556,41 @@ BuildNodesArrayValues(NodeAddressArray *nodeArray,
 	for (nodeIndex = 0; nodeIndex < nodeArray->count; nodeIndex++)
 	{
 		NodeAddress *node = &(nodeArray->nodes[nodeIndex]);
-		IntString nodeIdString = intToString(node->nodeId);
+		char *nodeIdString = intToString(node->nodeId).strValue;
 
 		int idParamIndex = paramIndex;
 		int lsnParamIndex = paramIndex + 1;
 
-		paramTypes[idParamIndex] = INT4OID;
-		paramValues[idParamIndex] = strdup(nodeIdString.strValue);
+		sqlParams->types[idParamIndex] = INT8OID;
+		strlcpy(sqlParams->nodeIds[nodeIndex], nodeIdString, NODEID_MAX_LENGTH);
 
-		paramTypes[lsnParamIndex] = LSNOID;
-		paramValues[lsnParamIndex] = node->lsn;
+		/* store the (char *) pointer to the data in values */
+		sqlParams->values[idParamIndex] = sqlParams->nodeIds[nodeIndex];
 
-		valuesIndex += sformat(buffer + valuesIndex, BUFSIZE - valuesIndex,
-							   "%s($%d, $%d%s)",
-							   valuesIndex == 0 ? "" : ",",
+		sqlParams->types[lsnParamIndex] = LSNOID;
+		strlcpy(sqlParams->lsns[nodeIndex], node->lsn, PG_LSN_MAXLENGTH);
 
-		                       /* we begin at $1 here: intentional off-by-one */
-							   idParamIndex + 1, lsnParamIndex + 1,
+		/* store the (char *) pointer to the data in values */
+		sqlParams->values[lsnParamIndex] = sqlParams->lsns[nodeIndex];
 
-		                       /* cast only the first row */
-							   valuesIndex == 0 ? "::pg_lsn" : "");
+		appendPQExpBuffer(values,
+						  "%s($%d, $%d%s)",
+						  paramIndex == 0 ? "" : ",",
 
-		if (valuesIndex > BUFSIZE)
-		{
-			/* shouldn't happen because we only support up to 12 nodes */
-			log_error("Failed to prepare the SQL query for "
-					  "pgsql_replication_slot_maintain");
-			return false;
-		}
+		                  /* we begin at $1 here: intentional off-by-one */
+						  idParamIndex + 1, lsnParamIndex + 1,
+
+		                  /* cast only the first row */
+						  paramIndex == 0 ? "::pg_lsn" : "");
 
 		/* prepare next round */
 		paramIndex += 2;
 	}
 
-	/* when we didn't find any node to process, return our empty set */
-	if (paramIndex == 0)
-	{
-		/* we know it fits, size is BUFSIZE or more */
-		sformat(values, size,
-				"SELECT id, lsn "
-				"FROM (values (null::int, null::pg_lsn)) as t(id, lsn) "
-				"where false");
-	}
-	else
-	{
-		int bytes = sformat(values, size, "values %s", buffer);
+	/* count how many parameters where appended to the VALUES() parts */
+	sqlParams->count = paramIndex;
 
-		if (bytes > size)
-		{
-			/* shouldn't happen because we only support up to 12 nodes */
-			log_error("Failed to prepare the SQL query for "
-					  "pgsql_replication_slot_maintain");
-			return false;
-		}
-	}
-	return paramIndex;
+	return true;
 }
 
 
@@ -1549,8 +1607,8 @@ BuildNodesArrayValues(NodeAddressArray *nodeArray,
 bool
 pgsql_replication_slot_create_and_drop(PGSQL *pgsql, NodeAddressArray *nodeArray)
 {
-	char sql[2 * BUFSIZE] = { 0 };
-	char values[BUFSIZE] = { 0 };
+	PQExpBuffer query = createPQExpBuffer();
+	PQExpBuffer values = createPQExpBuffer();
 
 	/* *INDENT-OFF* */
 	char *sqlTemplate =
@@ -1584,29 +1642,34 @@ pgsql_replication_slot_create_and_drop(PGSQL *pgsql, NodeAddressArray *nodeArray
 		"SELECT 'drop', slot_name, NULL::pg_lsn FROM dropped";
 	/* *INDENT-ON* */
 
-	Oid paramTypes[NODE_ARRAY_MAX_COUNT * 2] = { 0 };
-	const char *paramValues[NODE_ARRAY_MAX_COUNT * 2] = { 0 };
+	nodesArraysValuesParams sqlParams = { 0 };
 	ReplicationSlotMaintainContext context = { 0 };
 
-	int paramCount = BuildNodesArrayValues(nodeArray,
-										   paramTypes, (char **) paramValues,
-										   values, BUFSIZE);
-
-	/* add the computed ($1,$2), ... string to the query "template" */
-	int bytes = sformat(sql, 2 * BUFSIZE, sqlTemplate, values);
-
-	if (bytes > 2 * BUFSIZE)
+	if (!BuildNodesArrayValues(nodeArray, &sqlParams, values))
 	{
-		/* shouldn't happen because we only support up to 12 nodes */
-		log_error("Failed to prepare the SQL query for "
-				  "pgsql_replication_slot_maintain");
+		/* errors have already been logged */
+		PQfreemem(query);
+		PQfreemem(values);
+
 		return false;
 	}
 
-	return pgsql_execute_with_params(pgsql, sql,
-									 paramCount, paramTypes, paramValues,
-									 &context,
-									 parseReplicationSlotMaintain);
+	/* add the computed ($1,$2), ... string to the query "template" */
+	appendPQExpBuffer(query, sqlTemplate, values->data);
+
+	bool success =
+		pgsql_execute_with_params(pgsql,
+								  query->data,
+								  sqlParams.count,
+								  sqlParams.types,
+								  (const char **) sqlParams.values,
+								  &context,
+								  parseReplicationSlotMaintain);
+
+	PQfreemem(query);
+	PQfreemem(values);
+
+	return success;
 }
 
 
@@ -1619,8 +1682,8 @@ pgsql_replication_slot_create_and_drop(PGSQL *pgsql, NodeAddressArray *nodeArray
 bool
 pgsql_replication_slot_maintain(PGSQL *pgsql, NodeAddressArray *nodeArray)
 {
-	char sql[2 * BUFSIZE] = { 0 };
-	char values[BUFSIZE] = { 0 };
+	PQExpBuffer query = createPQExpBuffer();
+	PQExpBuffer values = createPQExpBuffer();
 
 	/* *INDENT-OFF* */
 	char *sqlTemplate =
@@ -1641,6 +1704,7 @@ pgsql_replication_slot_maintain(PGSQL *pgsql, NodeAddressArray *nodeArray)
 		"  FROM pg_replication_slots s JOIN nodes USING(slot_name), "
 		"       LATERAL pg_replication_slot_advance(slot_name, lsn) a"
 		" WHERE nodes.lsn <> '0/0' and nodes.lsn >= s.restart_lsn "
+		"   and not s.active "
 		"), \n"
 		"created as ("
 		"SELECT c.slot_name, c.lsn "
@@ -1655,29 +1719,34 @@ pgsql_replication_slot_maintain(PGSQL *pgsql, NodeAddressArray *nodeArray)
 		"SELECT 'advance', slot_name, end_lsn FROM advanced ";
 	/* *INDENT-ON* */
 
-	Oid paramTypes[NODE_ARRAY_MAX_COUNT * 2] = { 0 };
-	const char *paramValues[NODE_ARRAY_MAX_COUNT * 2] = { 0 };
+	nodesArraysValuesParams sqlParams = { 0 };
 	ReplicationSlotMaintainContext context = { 0 };
 
-	int paramCount = BuildNodesArrayValues(nodeArray,
-										   paramTypes, (char **) paramValues,
-										   values, BUFSIZE);
-
-	/* add the computed ($1,$2), ... string to the query "template" */
-	int bytes = sformat(sql, 2 * BUFSIZE, sqlTemplate, values);
-
-	if (bytes > 2 * BUFSIZE)
+	if (!BuildNodesArrayValues(nodeArray, &sqlParams, values))
 	{
-		/* shouldn't happen because we only support up to 12 nodes */
-		log_error("Failed to prepare the SQL query for "
-				  "pgsql_replication_slot_maintain");
+		/* errors have already been logged */
+		PQfreemem(query);
+		PQfreemem(values);
+
 		return false;
 	}
 
-	return pgsql_execute_with_params(pgsql, sql,
-									 paramCount, paramTypes, paramValues,
-									 &context,
-									 parseReplicationSlotMaintain);
+	/* add the computed ($1,$2), ... string to the query "template" */
+	appendPQExpBuffer(query, sqlTemplate, values->data);
+
+	bool success =
+		pgsql_execute_with_params(pgsql,
+								  query->data,
+								  sqlParams.count,
+								  sqlParams.types,
+								  (const char **) sqlParams.values,
+								  &context,
+								  parseReplicationSlotMaintain);
+
+	PQfreemem(query);
+	PQfreemem(values);
+
+	return success;
 }
 
 
@@ -2226,13 +2295,16 @@ pgsql_create_user(PGSQL *pgsql, const char *userName, const char *password,
 
 	PQclear(result);
 	clear_results(pgsql);
+
 	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
 	{
 		pgsql_finish(pgsql);
 	}
-
-	/* restore the normal notice message processing, if needed. */
-	PQsetNoticeProcessor(connection, previousNoticeProcessor, NULL);
+	else
+	{
+		/* restore the normal notice message processing, if needed. */
+		PQsetNoticeProcessor(connection, previousNoticeProcessor, NULL);
+	}
 
 	return true;
 }
@@ -2415,7 +2487,8 @@ typedef struct PgMetadata
 bool
 pgsql_get_postgres_metadata(PGSQL *pgsql,
 							bool *pg_is_in_recovery,
-							char *pgsrSyncState, char *currentLSN,
+							char *pgsrSyncState,
+							char *currentLSN,
 							PostgresControlData *control)
 {
 	PgMetadata context = { 0 };
@@ -2437,7 +2510,11 @@ pgsql_get_postgres_metadata(PGSQL *pgsql,
 		" then coalesce(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())"
 		" else pg_current_wal_flush_lsn()"
 		" end as current_lsn,"
-		" pg_control_version, catalog_version_no, system_identifier"
+		" pg_control_version, catalog_version_no, system_identifier,"
+		" case when pg_is_in_recovery()"
+		" then (select received_tli from pg_stat_wal_receiver)"
+		" else (select timeline_id from pg_control_checkpoint()) "
+		" end as timeline_id "
 		" from (values(1)) as dummy"
 		" full outer join"
 		" (select pg_control_version, catalog_version_no, system_identifier "
@@ -2508,9 +2585,9 @@ parsePgMetadata(void *ctx, PGresult *result)
 	PgMetadata *context = (PgMetadata *) ctx;
 	char *value;
 
-	if (PQnfields(result) != 6)
+	if (PQnfields(result) != 7)
 	{
-		log_error("Query returned %d columns, expected 3", PQnfields(result));
+		log_error("Query returned %d columns, expected 7", PQnfields(result));
 		context->parsedOk = false;
 		return;
 	}
@@ -2568,6 +2645,26 @@ parsePgMetadata(void *ctx, PGresult *result)
 		log_error("Failed to parse system_identifier \"%s\"", value);
 		context->parsedOk = true;
 		return;
+	}
+
+	/*
+	 * On a standby node that doesn't have a primary_conninfo then we fail to
+	 * retrieve the received_tli from pg_stat_wal_receiver. We encode the NULL
+	 * we get in that case with a zero, which is not a value we expect.
+	 */
+	if (PQgetisnull(result, 0, 6))
+	{
+		context->control.timeline_id = 0;
+	}
+	else
+	{
+		value = PQgetvalue(result, 0, 6);
+		if (!stringToUInt(value, &(context->control.timeline_id)))
+		{
+			log_error("Failed to parse timeline_id \"%s\"", value);
+			context->parsedOk = true;
+			return;
+		}
 	}
 
 	context->parsedOk = true;
@@ -2730,15 +2827,21 @@ parsePgReachedTargetLSN(void *ctx, PGresult *result)
 }
 
 
-typedef struct IdentifySystem
+typedef struct IdentifySystemResult
 {
 	char sqlstate[6];
 	bool parsedOk;
-	uint64_t system_identifier;
-	int timeline;
-	char xlogpos[PG_LSN_MAXLENGTH];
-	char dbname[NAMEDATALEN];
-} IdentifySystem;
+	IdentifySystem *system;
+} IdentifySystemResult;
+
+
+typedef struct TimelineHistoryResult
+{
+	char sqlstate[6];
+	bool parsedOk;
+	char filename[MAXPGPATH];
+	char content[BUFSIZE * BUFSIZE]; /* 1MB should get us quite very far */
+} TimelineHistoryResult;
 
 
 /*
@@ -2747,12 +2850,8 @@ typedef struct IdentifySystem
  * contain the 'replication=1' parameter.
  */
 bool
-pgsql_identify_system(PGSQL *pgsql)
+pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system)
 {
-	IdentifySystem context = { 0 };
-	char *sql = "IDENTIFY_SYSTEM";
-
-
 	PGconn *connection = pgsql_open_connection(pgsql);
 	if (connection == NULL)
 	{
@@ -2761,7 +2860,7 @@ pgsql_identify_system(PGSQL *pgsql)
 	}
 
 	/* extended query protocol not supported in a replication connection */
-	PGresult *result = PQexec(connection, sql);
+	PGresult *result = PQexec(connection, "IDENTIFY_SYSTEM");
 
 	if (!is_response_ok(result))
 	{
@@ -2774,23 +2873,78 @@ pgsql_identify_system(PGSQL *pgsql)
 		return false;
 	}
 
-	(void) parseIdentifySystem((void *) &context, result);
+	IdentifySystemResult isContext = { { 0 }, false, system };
+
+	(void) parseIdentifySystemResult((void *) &isContext, result);
 
 	PQclear(result);
 	clear_results(pgsql);
-	PQfinish(connection);
 
-	if (!context.parsedOk)
+	log_debug("IDENTIFY_SYSTEM: timeline %d, xlogpos %s, systemid %" PRIu64,
+			  system->timeline,
+			  system->xlogpos,
+			  system->identifier);
+
+	if (!isContext.parsedOk)
 	{
 		log_error("Failed to get result from IDENTIFY_SYSTEM");
+		PQfinish(connection);
 		return false;
 	}
 
-	log_debug("IDENTIFY_SYSTEM: system identifier %" PRIu64 ", "
-															"timeline %d, xlogpos %s",
-			  context.system_identifier,
-			  context.timeline,
-			  context.xlogpos);
+	/* while at it, we also run the TIMELINE_HISTORY command */
+	if (system->timeline > 1)
+	{
+		TimelineHistoryResult hContext = { 0 };
+
+		char sql[BUFSIZE] = { 0 };
+		sformat(sql, sizeof(sql), "TIMELINE_HISTORY %d", system->timeline);
+
+		result = PQexec(connection, sql);
+
+		if (!is_response_ok(result))
+		{
+			log_error("Failed to request TIMELINE_HISTORY: %s",
+					  PQerrorMessage(connection));
+			PQclear(result);
+			clear_results(pgsql);
+
+			PQfinish(connection);
+
+			return false;
+		}
+
+		(void) parseTimelineHistoryResult((void *) &hContext, result);
+
+		PQclear(result);
+		clear_results(pgsql);
+
+		if (!hContext.parsedOk)
+		{
+			log_error("Failed to get result from TIMELINE_HISTORY");
+			PQfinish(connection);
+			return false;
+		}
+
+		if (!parseTimeLineHistory(hContext.filename, hContext.content, system))
+		{
+			/* errors have already been logged */
+			PQfinish(connection);
+			return false;
+		}
+
+		TimeLineHistoryEntry *current =
+			&(system->timelines.history[system->timelines.count - 1]);
+
+		log_debug("TIMELINE_HISTORY: \"%s\", timeline %d started at %X/%X",
+				  hContext.filename,
+				  current->tli,
+				  (uint32_t) (current->begin >> 32),
+				  (uint32_t) current->begin);
+	}
+
+	/* now we're done with running SQL queries */
+	PQfinish(connection);
 
 	return true;
 }
@@ -2801,9 +2955,9 @@ pgsql_identify_system(PGSQL *pgsql)
  * two columns from pg_stat_replication: sync_state and currentLSN.
  */
 static void
-parseIdentifySystem(void *ctx, PGresult *result)
+parseIdentifySystemResult(void *ctx, PGresult *result)
 {
-	IdentifySystem *context = (IdentifySystem *) ctx;
+	IdentifySystemResult *context = (IdentifySystemResult *) ctx;
 
 	if (PQnfields(result) != 4)
 	{
@@ -2825,29 +2979,207 @@ parseIdentifySystem(void *ctx, PGresult *result)
 		return;
 	}
 
+	/* systemid (text) */
 	char *value = PQgetvalue(result, 0, 0);
-	if (!stringToUInt64(value, &(context->system_identifier)))
+	if (!stringToUInt64(value, &(context->system->identifier)))
 	{
 		log_error("Failed to parse system_identifier \"%s\"", value);
 		context->parsedOk = false;
 		return;
 	}
 
+	/* timeline (int4) */
 	value = PQgetvalue(result, 0, 1);
-	if (!stringToInt(value, &(context->timeline)))
+	if (!stringToUInt32(value, &(context->system->timeline)))
 	{
 		log_error("Failed to parse timeline \"%s\"", value);
 		context->parsedOk = false;
 		return;
 	}
 
+	/* xlogpos (text) */
 	value = PQgetvalue(result, 0, 2);
-	strlcpy(context->xlogpos, value, PG_LSN_MAXLENGTH);
+	strlcpy(context->system->xlogpos, value, PG_LSN_MAXLENGTH);
 
-	value = PQgetvalue(result, 0, 3);
-	strlcpy(context->dbname, value, NAMEDATALEN);
+	/* dbname (text) Database connected to or null */
+	if (!PQgetisnull(result, 0, 3))
+	{
+		value = PQgetvalue(result, 0, 3);
+		strlcpy(context->system->dbname, value, NAMEDATALEN);
+	}
 
 	context->parsedOk = true;
+}
+
+
+/*
+ * parseTimelineHistory parses the result of the TIMELINE_HISTORY replication
+ * command.
+ */
+static void
+parseTimelineHistoryResult(void *ctx, PGresult *result)
+{
+	TimelineHistoryResult *context = (TimelineHistoryResult *) ctx;
+
+	if (PQnfields(result) != 2)
+	{
+		log_error("Query returned %d columns, expected 2", PQnfields(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	if (PQntuples(result) == 0)
+	{
+		log_debug("parseTimelineHistory: query returned no rows");
+		context->parsedOk = false;
+		return;
+	}
+
+	if (PQntuples(result) != 1)
+	{
+		log_error("Query returned %d rows, expected 1", PQntuples(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	/* filename (text) */
+	char *value = PQgetvalue(result, 0, 0);
+	strlcpy(context->filename, value, sizeof(context->filename));
+
+	/* content (bytea) */
+	value = PQgetvalue(result, 0, 1);
+
+	if (strlen(value) >= sizeof(context->content))
+	{
+		log_error("Received a timeline history file of %lu bytes, "
+				  "pg_autoctl is limited to files of up to %lu bytes.",
+				  (unsigned long) strlen(value),
+				  (unsigned long) sizeof(context->content));
+		context->parsedOk = false;
+	}
+	strlcpy(context->content, value, sizeof(context->content));
+
+	context->parsedOk = true;
+}
+
+
+/*
+ * parseTimeLineHistory parses the content of a timeline history file.
+ */
+bool
+parseTimeLineHistory(const char *filename, const char *content,
+					 IdentifySystem *system)
+{
+	char *historyLines[BUFSIZE] = { 0 };
+	int lineCount = splitLines((char *) content, historyLines, BUFSIZE);
+	int lineNumber = 0;
+
+	if (lineCount >= PG_AUTOCTL_MAX_TIMELINES)
+	{
+		log_error("history file \"%s\" contains %d lines, "
+				  "pg_autoctl only supports up to %d lines",
+				  filename, lineCount, PG_AUTOCTL_MAX_TIMELINES - 1);
+		return false;
+	}
+
+	uint64_t prevend = InvalidXLogRecPtr;
+
+	system->timelines.count = 0;
+
+	TimeLineHistoryEntry *entry =
+		&(system->timelines.history[system->timelines.count]);
+
+	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	{
+		char *ptr = historyLines[lineNumber];
+
+		/* skip leading whitespace and check for # comment */
+		for (; *ptr; ptr++)
+		{
+			if (!isspace((unsigned char) *ptr))
+			{
+				break;
+			}
+		}
+
+		if (*ptr == '\0' || *ptr == '#')
+		{
+			continue;
+		}
+
+		log_trace("parseTimeLineHistory line %d is \"%s\"",
+				  lineNumber,
+				  historyLines[lineNumber]);
+
+		char *tabptr = strchr(historyLines[lineNumber], '\t');
+
+		if (tabptr == NULL)
+		{
+			log_error("Failed to parse history file line %d: \"%s\"",
+					  lineNumber, ptr);
+			return false;
+		}
+
+		*tabptr = '\0';
+
+		if (!stringToUInt(historyLines[lineNumber], &(entry->tli)))
+		{
+			log_error("Failed to parse history timeline \"%s\"", tabptr);
+			return false;
+		}
+
+		char *lsn = tabptr + 1;
+
+		for (char *lsnend = lsn; *lsnend; lsnend++)
+		{
+			if (!(isxdigit((unsigned char) *lsnend) || *lsnend == '/'))
+			{
+				*lsnend = '\0';
+				break;
+			}
+		}
+
+		if (!parseLSN(lsn, &(entry->end)))
+		{
+			log_error("Failed to parse history timeline %d LSN \"%s\"",
+					  entry->tli, lsn);
+			return false;
+		}
+
+		entry->begin = prevend;
+		prevend = entry->end;
+
+		log_trace("parseTimeLineHistory[%d]: tli %d [%X/%X %X/%X]",
+				  system->timelines.count,
+				  entry->tli,
+				  (uint32) (entry->begin >> 32),
+				  (uint32) entry->begin,
+				  (uint32) (entry->end >> 32),
+				  (uint32) entry->end);
+
+		entry = &(system->timelines.history[++system->timelines.count]);
+	}
+
+	/*
+	 * Create one more entry for the "tip" of the timeline, which has no entry
+	 * in the history file.
+	 */
+	entry->tli = system->timeline;
+	entry->begin = prevend;
+	entry->end = InvalidXLogRecPtr;
+
+	log_trace("parseTimeLineHistory[%d]: tli %d [%X/%X %X/%X]",
+			  system->timelines.count,
+			  entry->tli,
+			  (uint32) (entry->begin >> 32),
+			  (uint32) entry->begin,
+			  (uint32) (entry->end >> 32),
+			  (uint32) entry->end);
+
+	/* fix the off-by-one so that the count is a count, not an index */
+	++system->timelines.count;
+
+	return true;
 }
 
 
@@ -3003,8 +3335,19 @@ pgsql_alter_extension_update_to(PGSQL *pgsql,
 	{
 		char *sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
 
-		log_error("Error %s while running Postgres query: %s: %s",
-				  sqlstate, command, PQerrorMessage(connection));
+		log_error("Error %s while running Postgres query: %s:",
+				  sqlstate, command);
+
+		char *message = PQerrorMessage(connection);
+		char *errorLines[BUFSIZE];
+		int lineCount = splitLines(message, errorLines, BUFSIZE);
+		int lineNumber = 0;
+
+		for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+		{
+			log_error("%s", errorLines[lineNumber]);
+		}
+
 		PQclear(result);
 		clear_results(pgsql);
 		pgsql_finish(pgsql);

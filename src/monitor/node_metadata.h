@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <inttypes.h>
+
 #include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
 
@@ -37,14 +39,15 @@
 #define Anum_pgautofailover_node_reportedpgisrunning 10
 #define Anum_pgautofailover_node_reportedrepstate 11
 #define Anum_pgautofailover_node_reporttime 12
-#define Anum_pgautofailover_node_reportedLSN 13
-#define Anum_pgautofailover_node_walreporttime 14
-#define Anum_pgautofailover_node_health 15
-#define Anum_pgautofailover_node_healthchecktime 16
-#define Anum_pgautofailover_node_statechangetime 17
-#define Anum_pgautofailover_node_candidate_priority 18
-#define Anum_pgautofailover_node_replication_quorum 19
-#define Anum_pgautofailover_node_nodecluster 20
+#define Anum_pgautofailover_node_reportedTLI 13
+#define Anum_pgautofailover_node_reportedLSN 14
+#define Anum_pgautofailover_node_walreporttime 15
+#define Anum_pgautofailover_node_health 16
+#define Anum_pgautofailover_node_healthchecktime 17
+#define Anum_pgautofailover_node_statechangetime 18
+#define Anum_pgautofailover_node_candidate_priority 19
+#define Anum_pgautofailover_node_replication_quorum 20
+#define Anum_pgautofailover_node_nodecluster 21
 
 #define AUTO_FAILOVER_NODE_TABLE_ALL_COLUMNS \
 	"formationid, " \
@@ -59,6 +62,7 @@
 	"reportedpgisrunning, " \
 	"reportedrepstate, " \
 	"reporttime, " \
+	"reportedtli, " \
 	"reportedlsn, " \
 	"walreporttime, " \
 	"health, " \
@@ -90,6 +94,7 @@ typedef enum SyncState
  * candidate.
  */
 #define MAX_USER_DEFINED_CANDIDATE_PRIORITY 100
+#define CANDIDATE_PRIORITY_INCREMENT (MAX_USER_DEFINED_CANDIDATE_PRIORITY + 1)
 
 
 /*
@@ -97,9 +102,9 @@ typedef enum SyncState
  * AutoFailoverNode, for consistency. Well, apart when registering, where we
  * don't have the node id and/or the node name yet.
  */
-#define NODE_FORMAT "node %d \"%s\" (%s:%d)"
+#define NODE_FORMAT "node %lld \"%s\" (%s:%d)"
 #define NODE_FORMAT_ARGS(node) \
-	node->nodeId, node->nodeName, node->nodeHost, node->nodePort
+	(long long) node->nodeId, node->nodeName, node->nodeHost, node->nodePort
 
 /*
  * AutoFailoverNode represents a Postgres node that is being tracked by the
@@ -108,7 +113,7 @@ typedef enum SyncState
 typedef struct AutoFailoverNode
 {
 	char *formationId;
-	int nodeId;
+	int64 nodeId;
 	int groupId;
 	char *nodeName;
 	char *nodeHost;
@@ -123,6 +128,7 @@ typedef struct AutoFailoverNode
 	NodeHealthState health;
 	TimestampTz healthCheckTime;
 	TimestampTz stateChangeTime;
+	int reportedTLI;
 	XLogRecPtr reportedLSN;
 	int candidatePriority;
 	bool replicationQuorum;
@@ -147,6 +153,7 @@ typedef enum FormationKind
 /* public function declarations */
 extern List * AllAutoFailoverNodes(char *formationId);
 extern List * AutoFailoverNodeGroup(char *formationId, int groupId);
+extern List * AutoFailoverAllNodesInGroup(char *formationId, int groupId);
 extern List * AutoFailoverOtherNodesList(AutoFailoverNode *pgAutoFailoverNode);
 extern List * AutoFailoverOtherNodesListInState(AutoFailoverNode *pgAutoFailoverNode,
 												ReplicationState currentState);
@@ -167,7 +174,7 @@ extern AutoFailoverNode * FindMostAdvancedStandby(List *groupNodeList);
 extern AutoFailoverNode * FindCandidateNodeBeingPromoted(List *groupNodeList);
 
 extern AutoFailoverNode * GetAutoFailoverNode(char *nodeHost, int nodePort);
-extern AutoFailoverNode * GetAutoFailoverNodeById(int nodeId);
+extern AutoFailoverNode * GetAutoFailoverNodeById(int64 nodeId);
 extern AutoFailoverNode * GetAutoFailoverNodeByName(char *formationId,
 													char *nodeName);
 extern AutoFailoverNode * OtherNodeInGroup(AutoFailoverNode *pgAutoFailoverNode);
@@ -176,7 +183,7 @@ extern AutoFailoverNode * TupleToAutoFailoverNode(TupleDesc tupleDescriptor,
 												  HeapTuple heapTuple);
 extern int AddAutoFailoverNode(char *formationId,
 							   FormationKind formationKind,
-							   int nodeId,
+							   int64 nodeId,
 							   int groupId,
 							   char *nodeName,
 							   char *nodeHost,
@@ -194,16 +201,17 @@ extern void ReportAutoFailoverNodeState(char *nodeHost, int nodePort,
 										ReplicationState reportedState,
 										bool pgIsRunning,
 										SyncState pgSyncState,
+										int reportedTLI,
 										XLogRecPtr reportedLSN);
 extern void ReportAutoFailoverNodeHealth(char *nodeHost, int nodePort,
 										 ReplicationState goalState,
 										 NodeHealthState health);
-extern void ReportAutoFailoverNodeReplicationSetting(int nodeid,
+extern void ReportAutoFailoverNodeReplicationSetting(int64 nodeid,
 													 char *nodeHost,
 													 int nodePort,
 													 int candidatePriority,
 													 bool replicationQuorum);
-extern void UpdateAutoFailoverNodeMetadata(int nodeid,
+extern void UpdateAutoFailoverNodeMetadata(int64 nodeid,
 										   char *nodeName,
 										   char *nodeHost,
 										   int nodePort);
@@ -218,6 +226,8 @@ extern bool CanTakeWritesInState(ReplicationState state);
 extern bool CanInitiateFailover(ReplicationState state);
 extern bool StateBelongsToPrimary(ReplicationState state);
 extern bool IsBeingPromoted(AutoFailoverNode *node);
+extern bool IsBeingDemotedPrimary(AutoFailoverNode *node);
+extern bool IsDemotedPrimary(AutoFailoverNode *node);
 extern bool CandidateNodeIsReadyToStreamWAL(AutoFailoverNode *node);
 extern bool IsParticipatingInPromotion(AutoFailoverNode *node);
 extern bool IsInWaitOrJoinState(AutoFailoverNode *node);

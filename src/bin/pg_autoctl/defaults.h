@@ -14,10 +14,10 @@
 #define PG_AUTOCTL_STATE_VERSION 1
 
 /* additional version information for printing version on CLI */
-#define PG_AUTOCTL_VERSION "1.5.1"
+#define PG_AUTOCTL_VERSION "1.6.1"
 
 /* version of the extension that we requite to talk to on the monitor */
-#define PG_AUTOCTL_EXTENSION_VERSION "1.5"
+#define PG_AUTOCTL_EXTENSION_VERSION "1.6"
 
 /* environment variable to use to make DEBUG facilities available */
 #define PG_AUTOCTL_DEBUG "PG_AUTOCTL_DEBUG"
@@ -152,7 +152,8 @@
 #define EXIT_CODE_RELOAD 9
 #define EXIT_CODE_INTERNAL_ERROR 12
 #define EXIT_CODE_EXTENSION_MISSING 13
-
+#define EXIT_CODE_DROPPED 121   /* node was dropped, stop everything and quit */
+#define EXIT_CODE_FATAL 122     /* error is fatal, no retry, quit now */
 
 /*
  * This opens file write only and creates if it doesn't exist.

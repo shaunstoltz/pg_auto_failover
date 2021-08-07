@@ -24,6 +24,7 @@
  *
  */
 
+#include <inttypes.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -38,6 +39,9 @@
 #include "pghba.h"
 #include "primary_standby.h"
 #include "state.h"
+
+
+static bool fsm_init_standby_from_upstream(Keeper *keeper);
 
 
 /*
@@ -228,7 +232,7 @@ fsm_init_primary(Keeper *keeper)
 		return false;
 	}
 
-	if (!postgres_add_default_settings(postgres))
+	if (!postgres_add_default_settings(postgres, config->hostname))
 	{
 		log_error("Failed to initialize postgres as primary because "
 				  "adding default settings failed, see above for details");
@@ -829,41 +833,16 @@ fsm_checkpoint_and_stop_postgres(Keeper *keeper)
 
 
 /*
- * fsm_init_standby is used when the primary is now ready to accept a standby,
- * we're the standby.
+ * fsm_init_standby_from_upstream is the work horse for both fsm_init_standby
+ * and fsm_init_from_standby. The replication source must have been setup
+ * already.
  */
-bool
-fsm_init_standby(Keeper *keeper)
+static bool
+fsm_init_standby_from_upstream(Keeper *keeper)
 {
 	KeeperConfig *config = &(keeper->config);
 	Monitor *monitor = &(keeper->monitor);
 	LocalPostgresServer *postgres = &(keeper->postgres);
-
-	NodeAddress *primaryNode = NULL;
-
-
-	/* get the primary node to follow */
-	if (!keeper_get_primary(keeper, &(postgres->replicationSource.primaryNode)))
-	{
-		log_error("Failed to initialize standby for lack of a primary node, "
-				  "see above for details");
-		return false;
-	}
-
-	if (!standby_init_replication_source(postgres,
-										 primaryNode,
-										 PG_AUTOCTL_REPLICA_USERNAME,
-										 config->replication_password,
-										 config->replication_slot_name,
-										 config->maximum_backup_rate,
-										 config->backupDirectory,
-										 NULL, /* no targetLSN */
-										 config->pgSetup.ssl,
-										 keeper->state.current_node_id))
-	{
-		/* can't happen at the moment */
-		return false;
-	}
 
 	/*
 	 * At pg_autoctl create time when PGDATA already exists and we were
@@ -880,7 +859,7 @@ fsm_init_standby(Keeper *keeper)
 
 	if (!standby_init_database(postgres, config->hostname, skipBaseBackup))
 	{
-		log_error("Failed initialize standby server, see above for details");
+		log_error("Failed to initialize standby server, see above for details");
 		return false;
 	}
 
@@ -924,6 +903,46 @@ fsm_init_standby(Keeper *keeper)
 
 
 /*
+ * fsm_init_standby is used when the primary is now ready to accept a standby,
+ * we're the standby.
+ */
+bool
+fsm_init_standby(Keeper *keeper)
+{
+	KeeperConfig *config = &(keeper->config);
+	LocalPostgresServer *postgres = &(keeper->postgres);
+
+	NodeAddress *primaryNode = NULL;
+
+
+	/* get the primary node to follow */
+	if (!keeper_get_primary(keeper, &(postgres->replicationSource.primaryNode)))
+	{
+		log_error("Failed to initialize standby for lack of a primary node, "
+				  "see above for details");
+		return false;
+	}
+
+	if (!standby_init_replication_source(postgres,
+										 primaryNode,
+										 PG_AUTOCTL_REPLICA_USERNAME,
+										 config->replication_password,
+										 config->replication_slot_name,
+										 config->maximum_backup_rate,
+										 config->backupDirectory,
+										 NULL, /* no targetLSN */
+										 config->pgSetup.ssl,
+										 keeper->state.current_node_id))
+	{
+		/* can't happen at the moment */
+		return false;
+	}
+
+	return fsm_init_standby_from_upstream(keeper);
+}
+
+
+/*
  * fsm_rewind_or_init is used when a new primary is available. First, try to
  * rewind. If that fails, do a pg_basebackup.
  */
@@ -932,6 +951,7 @@ fsm_rewind_or_init(Keeper *keeper)
 {
 	KeeperConfig *config = &(keeper->config);
 	LocalPostgresServer *postgres = &(keeper->postgres);
+	ReplicationSource *upstream = &(postgres->replicationSource);
 
 	NodeAddress *primaryNode = NULL;
 
@@ -955,6 +975,19 @@ fsm_rewind_or_init(Keeper *keeper)
 										 keeper->state.current_node_id))
 	{
 		/* can't happen at the moment */
+		return false;
+	}
+
+	/* first, make sure we can connect with "replication" */
+	if (!pgctl_identify_system(upstream))
+	{
+		log_error("Failed to connect to the primary node " NODE_FORMAT
+				  "with a replication connection string. "
+				  "See above for details",
+				  upstream->primaryNode.nodeId,
+				  upstream->primaryNode.name,
+				  upstream->primaryNode.host,
+				  upstream->primaryNode.port);
 		return false;
 	}
 
@@ -992,15 +1025,24 @@ fsm_rewind_or_init(Keeper *keeper)
 
 
 /*
- * fsm_maintain_replication_slots is used when going from CATCHINGUP to
- * SECONDARY, to create missing replication slots. We want to maintain a
- * replication slot for each of the other nodes in the system, so that we make
- * sure we have the WAL bytes around when a standby nodes has to follow a new
- * primary, after failover.
+ * fsm_prepare_for_secondary is used when going from CATCHINGUP to SECONDARY,
+ * to create missing replication slots. We want to maintain a replication slot
+ * for each of the other nodes in the system, so that we make sure we have the
+ * WAL bytes around when a standby nodes has to follow a new primary, after
+ * failover.
  */
 bool
-fsm_maintain_replication_slots(Keeper *keeper)
+fsm_prepare_for_secondary(Keeper *keeper)
 {
+	LocalPostgresServer *postgres = &(keeper->postgres);
+
+	/* first. check that we're on the same timeline as the new primary */
+	if (!standby_check_timeline_with_upstream(postgres))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	return keeper_maintain_replication_slots(keeper);
 }
 
@@ -1269,8 +1311,8 @@ fsm_fast_forward(Keeper *keeper)
 
 	if (!standby_fetch_missing_wal(postgres))
 	{
-		log_error("Failed to fetch WAL bytes from standby node %d \"%s\" (%s:%d), "
-				  "see above for details",
+		log_error("Failed to fetch WAL bytes from standby node " NODE_FORMAT
+				  ", see above for details",
 				  upstream->primaryNode.nodeId,
 				  upstream->primaryNode.name,
 				  upstream->primaryNode.host,
@@ -1283,11 +1325,11 @@ fsm_fast_forward(Keeper *keeper)
 
 
 /*
- * fsm_cleanup_and_resume_as_primary cleans-up the replication setting and
- * start the local node as primary. It's called after a fast-forward operation.
+ * fsm_cleanup_as_primary cleans-up the replication setting. It's called after
+ * a fast-forward operation.
  */
 bool
-fsm_cleanup_and_resume_as_primary(Keeper *keeper)
+fsm_cleanup_as_primary(Keeper *keeper)
 {
 	LocalPostgresServer *postgres = &(keeper->postgres);
 
@@ -1295,13 +1337,6 @@ fsm_cleanup_and_resume_as_primary(Keeper *keeper)
 	{
 		log_error("Failed to cleanup replication settings and restart Postgres "
 				  "to continue as a primary, see above for details");
-		return false;
-	}
-
-	if (!keeper_restart_postgres(keeper))
-	{
-		log_error("Failed to restart Postgres after changing its "
-				  "primary conninfo, see above for details");
 		return false;
 	}
 
@@ -1349,7 +1384,7 @@ fsm_follow_new_primary(Keeper *keeper)
 	if (!standby_follow_new_primary(postgres))
 	{
 		log_error("Failed to change standby setup to follow new primary "
-				  "node %d \"%s\" (%s:%d), see above for details",
+				  "node " NODE_FORMAT ", see above for details",
 				  replicationSource->primaryNode.nodeId,
 				  replicationSource->primaryNode.name,
 				  replicationSource->primaryNode.host,
@@ -1358,5 +1393,82 @@ fsm_follow_new_primary(Keeper *keeper)
 	}
 
 	/* now, in case we have an init state file around, remove it */
+	if (!unlink_file(config->pathnames.init))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * Finally, check that we're on the same timeline as the new primary when
+	 * assigned secondary as a goal state. This transition function is also
+	 * used when going from secondary to catchingup, as the primary might have
+	 * changed also in that situation.
+	 */
+	if (keeper->state.assigned_role == SECONDARY_STATE)
+	{
+		return standby_check_timeline_with_upstream(postgres);
+	}
+
+	return true;
+}
+
+
+/*
+ * fsm_init_from_standby creates a new node from existing nodes that are still
+ * available but not setup to be a candidate for promotion.
+ */
+bool
+fsm_init_from_standby(Keeper *keeper)
+{
+	KeeperConfig *config = &(keeper->config);
+	LocalPostgresServer *postgres = &(keeper->postgres);
+
+	NodeAddress upstreamNode = { 0 };
+
+	/* get the primary node to follow */
+	if (!keeper_get_most_advanced_standby(keeper, &upstreamNode))
+	{
+		log_error("Failed to initialise from the most advanced standby node, "
+				  "see above for details");
+		return false;
+	}
+
+	if (!standby_init_replication_source(postgres,
+										 &upstreamNode,
+										 PG_AUTOCTL_REPLICA_USERNAME,
+										 config->replication_password,
+										 "", /* no replication slot */
+										 config->maximum_backup_rate,
+										 config->backupDirectory,
+										 upstreamNode.lsn,
+										 config->pgSetup.ssl,
+										 keeper->state.current_node_id))
+	{
+		/* can't happen at the moment */
+		return false;
+	}
+
+	return fsm_init_standby_from_upstream(keeper);
+}
+
+
+/*
+ * fsm_drop_node is called to finish dropping a node on the client side.
+ *
+ * This stops postgres and updates the postgres state file to say that postgres
+ * should be stopped. It also cleans up any existing init file. Not doing these
+ * two things can confuse a possible future re-init of the node.
+ */
+bool
+fsm_drop_node(Keeper *keeper)
+{
+	KeeperConfig *config = &(keeper->config);
+	if (!fsm_stop_postgres(keeper))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	return unlink_file(config->pathnames.init);
 }

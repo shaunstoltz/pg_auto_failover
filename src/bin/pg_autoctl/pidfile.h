@@ -67,4 +67,8 @@ void check_pidfile(const char *pidfile, pid_t start_pid);
 
 void pidfile_as_json(JSON_Value *js, const char *pidfile, bool includeStatus);
 
+bool is_process_stopped(const char *pidfile, bool *stopped, pid_t *pid);
+bool wait_for_process_to_stop(const char *pidfile, int timeout, bool *stopped,
+							  pid_t *pid);
+
 #endif /* PIDFILE_H */

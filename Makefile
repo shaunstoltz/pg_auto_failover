@@ -1,6 +1,8 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the PostgreSQL License.
 
+TOP := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
 CONTAINER_NAME = pg_auto_failover
 TEST_CONTAINER_NAME = pg_auto_failover_test
 DOCKER_RUN_OPTS = --privileged  -ti --rm
@@ -13,13 +15,15 @@ TESTS_MONITOR += test_installcheck
 TESTS_MONITOR += test_monitor_disabled
 TESTS_MONITOR += test_replace_monitor
 
+# This could be in TESTS_MULTI, but adding it here optimizes Travis run time
+TESTS_MONITOR += test_multi_alternate_primary_failures
+
 # Tests for single standby
 TESTS_SINGLE  = test_auth
 TESTS_SINGLE += test_basic_operation
 TESTS_SINGLE += test_basic_operation_listen_flag
 TESTS_SINGLE += test_create_run
 TESTS_SINGLE += test_create_standby_with_pgdata
-TESTS_SINGLE += test_debian_clusters
 TESTS_SINGLE += test_ensure
 TESTS_SINGLE += test_skip_pg_hba
 
@@ -27,6 +31,9 @@ TESTS_SINGLE += test_skip_pg_hba
 TESTS_SSL  = test_enable_ssl
 TESTS_SSL += test_ssl_cert
 TESTS_SSL += test_ssl_self_signed
+
+# This could be in TESTS_SINGLE, but adding it here optimizes Travis run time
+TESTS_SSL += test_debian_clusters
 
 # Tests for multiple standbys
 TESTS_MULTI  = test_multi_async
@@ -55,7 +62,15 @@ FSM = docs/fsm.png
 PDF = ./docs/_build/latex/pg_auto_failover.pdf
 
 # Command line with DEBUG facilities
-PG_AUTOCTL = PG_AUTOCTL_DEBUG=1 ./src/bin/pg_autoctl/pg_autoctl
+VALGRIND ?=
+ifeq ($(VALGRIND),)
+	BINPATH = ./src/bin/pg_autoctl/pg_autoctl
+	PG_AUTOCTL = PG_AUTOCTL_DEBUG=1 ./src/bin/pg_autoctl/pg_autoctl
+else
+	BINPATH = $(abspath $(TOP))/src/tools/pg_autoctl.valgrind
+	PG_AUTOCTL = PG_AUTOCTL_DEBUG=1 PG_AUTOCTL_DEBUG_BIN_PATH="$(BINPATH)" ./src/tools/pg_autoctl.valgrind
+endif
+
 
 NODES ?= 2						# total count of Postgres nodes
 NODES_ASYNC ?= 0				# count of replication-quorum false nodes
@@ -77,11 +92,11 @@ AZURE_LOCATION ?= francecentral
 # Pick a version of Postgres and pg_auto_failover packages to install
 # in our target Azure VMs when provisionning
 #
-#  sudo apt-get install -q -y postgresql-13-auto-failover-1.5=1.5.1
+#  sudo apt-get install -q -y postgresql-13-auto-failover-1.5=1.5.2
 #  postgresql-${AZ_PG_VERSION}-auto-failover-${AZ_PGAF_DEB_VERSION}=${AZ_PGAF_VERSION}
 AZ_PG_VERSION ?= 13
-AZ_PGAF_DEB_VERSION ?= 1.5
-AZ_PGAF_DEB_REVISION ?= 1.5.1-1
+AZ_PGAF_DEB_VERSION ?= 1.6
+AZ_PGAF_DEB_REVISION ?= 1.6.1-1
 
 export AZ_PG_VERSION
 export AZ_PGAF_DEB_VERSION
@@ -118,6 +133,7 @@ test:
 	sudo -E env "PATH=${PATH}" USER=$(shell whoami) \
 		$(NOSETESTS)			\
 		--verbose				\
+		--nologcapture			\
 		--nocapture				\
 		--stop					\
 		${TEST_ARGUMENT}
@@ -154,6 +170,18 @@ run-test: build-test
 		make -C /usr/src/pg_auto_failover test	\
 		TEST='${TEST}'
 
+build-i386:
+	docker build -t i386:latest -f Dockerfile.i386 .
+
+# expected to be run from within the i386 docker container
+installcheck-i386:
+	pg_autoctl run &
+	pg_autoctl do pgsetup wait
+	$(MAKE) -C src/monitor installcheck
+
+run-installcheck-i386: build-i386
+	docker run --platform linux/386 --rm -it --privileged i386 make installcheck-i386
+
 man:
 	$(MAKE) -C docs man
 
@@ -181,17 +209,18 @@ $(TMUX_SCRIPT): bin
          --node-priorities $(NODES_PRIOS) \
          --sync-standbys $(NODES_SYNC_SB) \
          $(CLUSTER_OPTS)                  \
+         --binpath $(BINPATH)             \
 		 --layout $(TMUX_LAYOUT) > $@
 
 tmux-script: $(TMUX_SCRIPT) ;
 
-tmux-clean:
+tmux-clean: bin
 	$(PG_AUTOCTL) do tmux clean           \
          --root $(TMUX_TOP_DIR)           \
          --first-pgport $(FIRST_PGPORT)   \
          --nodes $(NODES)
 
-cluster: install tmux-clean
+tmux-session: bin
 	$(PG_AUTOCTL) do tmux session         \
          --root $(TMUX_TOP_DIR)           \
          --first-pgport $(FIRST_PGPORT)   \
@@ -200,8 +229,31 @@ cluster: install tmux-clean
          --node-priorities $(NODES_PRIOS) \
          --sync-standbys $(NODES_SYNC_SB) \
          $(CLUSTER_OPTS)                  \
+         --binpath $(BINPATH)             \
          --layout $(TMUX_LAYOUT)
 
+cluster: install tmux-clean
+	# This is explicitly not a target, otherwise when make uses multiple jobs
+	# tmux-clean and tmux-session can have a race condidition where tmux-clean
+	# removes the files that are just created by tmux-session.
+	$(MAKE) tmux-session
+
+valgrind-session: build-test
+	docker run                             \
+	    --name $(TEST_CONTAINER_NAME) 	   \
+		$(DOCKER_RUN_OPTS)			       \
+		$(TEST_CONTAINER_NAME)			   \
+	    make -C /usr/src/pg_auto_failover  \
+	     VALGRIND=1 					   \
+	     TMUX_TOP_DIR=/tmp/tmux 	       \
+		 NODES=$(NODES) 				   \
+		 NODES_ASYNC=$(NODES_ASYNC)        \
+		 NODES_PRIOS=$(NODES_PRIOS)        \
+		 NODES_SYNC_SB=$(NODES_SYNC_SB)    \
+		 CLUSTER_OPTS=$(CLUSTER_OPTS)      \
+		 TMUX_EXTRA_COMMANDS=$(TMUX_EXTRA_COMMANDS) \
+		 TMUX_LAYOUT=$(TMUX_LAYOUT)        \
+	     tmux-session
 
 azcluster: all
 	$(PG_AUTOCTL) do azure create         \

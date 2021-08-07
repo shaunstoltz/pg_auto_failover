@@ -14,6 +14,7 @@
 
 #include "pgsql.h"
 #include "monitor_config.h"
+#include "nodestate_utils.h"
 #include "primary_standby.h"
 #include "state.h"
 
@@ -28,7 +29,7 @@ typedef struct Monitor
 typedef struct MonitorAssignedState
 {
 	char name[_POSIX_HOST_NAME_MAX];
-	int nodeId;
+	int64_t nodeId;
 	int groupId;
 	NodeState state;
 	int candidatePriority;
@@ -42,7 +43,7 @@ typedef struct StateNotification
 	NodeState goalState;
 	char formationId[NAMEDATALEN];
 	int groupId;
-	int nodeId;
+	int64_t nodeId;
 	char hostName[_POSIX_HOST_NAME_MAX];
 	int nodePort;
 } StateNotification;
@@ -53,11 +54,19 @@ typedef struct MonitorExtensionVersion
 	char installedVersion[BUFSIZE];
 } MonitorExtensionVersion;
 
+typedef struct CoordinatorNodeAddress
+{
+	bool found;
+	NodeAddress node;
+} CoordinatorNodeAddress;
+
+#define NODE_FORMAT "%" PRId64 " \"%s\" (%s:%d)"
+
 bool monitor_init(Monitor *monitor, char *url);
-void monitor_setup_notifications(Monitor *monitor, int groupId, int nodeId);
+void monitor_setup_notifications(Monitor *monitor, int groupId, int64_t nodeId);
 bool monitor_has_received_notifications(Monitor *monitor);
 bool monitor_process_state_notification(int notificationGroupId,
-										int notificationNodeId,
+										int64_t notificationNodeId,
 										char *channel,
 										char *payload);
 bool monitor_local_init(Monitor *monitor);
@@ -70,19 +79,19 @@ bool monitor_get_nodes(Monitor *monitor, char *formation, int groupId,
 bool monitor_print_nodes(Monitor *monitor, char *formation, int groupId);
 bool monitor_print_nodes_as_json(Monitor *monitor, char *formation, int groupId);
 bool monitor_get_other_nodes(Monitor *monitor,
-							 int myNodeId,
+							 int64_t myNodeId,
 							 NodeState currentState,
 							 NodeAddressArray *nodeArray);
 bool monitor_print_other_nodes(Monitor *monitor,
-							   int myNodeId, NodeState currentState);
+							   int64_t myNodeId, NodeState currentState);
 bool monitor_print_other_nodes_as_json(Monitor *monitor,
-									   int myNodeId,
+									   int64_t myNodeId,
 									   NodeState currentState);
 
 bool monitor_get_primary(Monitor *monitor, char *formation, int groupId,
 						 NodeAddress *node);
 bool monitor_get_coordinator(Monitor *monitor, char *formation,
-							 NodeAddress *node);
+							 CoordinatorNodeAddress *coordinatorNodeAddress);
 bool monitor_get_most_advanced_standby(Monitor *monitor,
 									   char *formation, int groupId,
 									   NodeAddress *node);
@@ -93,7 +102,7 @@ bool monitor_register_node(Monitor *monitor,
 						   int port,
 						   uint64_t system_identifier,
 						   char *dbname,
-						   int desiredNodeId,
+						   int64_t desiredNodeId,
 						   int desiredGroupId,
 						   NodeState initialState,
 						   PgInstanceKind kind,
@@ -103,9 +112,9 @@ bool monitor_register_node(Monitor *monitor,
 						   bool *mayRetry,
 						   MonitorAssignedState *assignedState);
 bool monitor_node_active(Monitor *monitor,
-						 char *formation, int nodeId,
+						 char *formation, int64_t nodeId,
 						 int groupId, NodeState currentState,
-						 bool pgIsRunning,
+						 bool pgIsRunning, int currentTLI,
 						 char *currentLSN, char *pgsrSyncState,
 						 MonitorAssignedState *assignedState);
 bool monitor_get_node_replication_settings(Monitor *monitor,
@@ -121,7 +130,12 @@ bool monitor_get_formation_number_sync_standbys(Monitor *monitor, char *formatio
 bool monitor_set_formation_number_sync_standbys(Monitor *monitor, char *formation,
 												int numberSyncStandbys);
 
-bool monitor_remove(Monitor *monitor, char *host, int port);
+bool monitor_remove_by_hostname(Monitor *monitor,
+								char *host, int port, bool force,
+								int64_t *nodeId, int *groupId);
+bool monitor_remove_by_nodename(Monitor *monitor,
+								char *formation, char *name, bool force,
+								int64_t *nodeId, int *groupId);
 
 bool monitor_count_groups(Monitor *monitor, char *formation, int *groupsCount);
 bool monitor_get_groupId_from_name(Monitor *monitor,
@@ -131,6 +145,8 @@ bool monitor_get_groupId_from_name(Monitor *monitor,
 bool monitor_perform_failover(Monitor *monitor, char *formation, int group);
 bool monitor_perform_promotion(Monitor *monitor, char *formation, char *name);
 
+bool monitor_get_current_state(Monitor *monitor, char *formation, int group,
+							   CurrentNodeStateArray *nodesArray);
 bool monitor_print_state(Monitor *monitor, char *formation, int group);
 bool monitor_print_last_events(Monitor *monitor,
 							   char *formation, int group, int count);
@@ -154,6 +170,10 @@ bool monitor_disable_secondary_for_formation(Monitor *monitor,
 
 bool monitor_drop_formation(Monitor *monitor, char *formation);
 
+bool monitor_count_failover_candidates(Monitor *monitor,
+									   char *formation, int groupId,
+									   int *failoverCandidateCount);
+
 bool monitor_print_formation_settings(Monitor *monitor, char *formation);
 bool monitor_print_formation_settings_as_json(Monitor *monitor, char *formation);
 
@@ -170,19 +190,19 @@ bool monitor_synchronous_standby_names(Monitor *monitor,
 									   int size);
 
 bool monitor_update_node_metadata(Monitor *monitor,
-								  int nodeId,
+								  int64_t nodeId,
 								  const char *name,
 								  const char *hostname,
 								  int port);
 bool monitor_set_node_system_identifier(Monitor *monitor,
-										int nodeId,
+										int64_t nodeId,
 										uint64_t system_identifier);
 bool monitor_set_group_system_identifier(Monitor *monitor,
 										 int groupId,
 										 uint64_t system_identifier);
 
-bool monitor_start_maintenance(Monitor *monitor, int nodeId, bool *mayRetry);
-bool monitor_stop_maintenance(Monitor *monitor, int nodeId, bool *mayRetry);
+bool monitor_start_maintenance(Monitor *monitor, int64_t nodeId, bool *mayRetry);
+bool monitor_stop_maintenance(Monitor *monitor, int64_t nodeId, bool *mayRetry);
 
 bool monitor_get_notifications(Monitor *monitor, int timeoutMs);
 bool monitor_wait_until_primary_applied_settings(Monitor *monitor,
@@ -191,17 +211,18 @@ bool monitor_wait_until_some_node_reported_state(Monitor *monitor,
 												 const char *formation,
 												 int groupId,
 												 PgInstanceKind nodeKind,
-												 NodeState targetState);
+												 NodeState targetState,
+												 int timeout);
 bool monitor_wait_until_node_reported_state(Monitor *monitor,
 											const char *formation,
 											int groupId,
-											int nodeId,
+											int64_t nodeId,
 											PgInstanceKind nodeKind,
 											NodeState targetState);
 bool monitor_wait_for_state_change(Monitor *monitor,
 								   const char *formation,
 								   int groupId,
-								   int nodeId,
+								   int64_t nodeId,
 								   int timeoutMs,
 								   bool *stateHasChanged);
 bool monitor_get_extension_version(Monitor *monitor,
@@ -211,5 +232,10 @@ bool monitor_ensure_extension_version(Monitor *monitor,
 									  LocalPostgresServer *postgres,
 									  MonitorExtensionVersion *version);
 
+bool monitor_find_node_by_nodeid(Monitor *monitor,
+								 const char *formation,
+								 int groupId,
+								 int64_t nodeId,
+								 NodeAddressArray *nodesArray);
 
 #endif /* MONITOR_H */

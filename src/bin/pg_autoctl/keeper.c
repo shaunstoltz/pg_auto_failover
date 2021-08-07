@@ -18,6 +18,7 @@
 #include "cli_common.h"
 #include "env_utils.h"
 #include "file_utils.h"
+#include "fsm.h"
 #include "keeper.h"
 #include "keeper_config.h"
 #include "keeper_pg_init.h"
@@ -102,7 +103,7 @@ keeper_store_state(Keeper *keeper)
  * it to disk.
  */
 bool
-keeper_update_state(Keeper *keeper, int node_id, int group_id,
+keeper_update_state(Keeper *keeper, int64_t node_id, int group_id,
 					NodeState state, bool update_last_monitor_contact)
 {
 	KeeperStateData *keeperState = &(keeper->state);
@@ -112,6 +113,22 @@ keeper_update_state(Keeper *keeper, int node_id, int group_id,
 	{
 		keeperState->last_monitor_contact = now;
 	}
+
+	/*
+	 * See state.h for details about why this test. We could migrate the state
+	 * nodeId to an int64_t, but that's a TODO item still at this point. It
+	 * would require being able to read the old state format on-disk and
+	 * convert automatically to the new one in-memory.
+	 */
+	if (node_id >= LONG_MAX)
+	{
+		log_fatal("Current node id does not fit in a 32 bits integer.");
+		log_info("Please report a bug to pg_auto_failover by opening "
+				 "an issue on Github project at "
+				 "https://github.com/citusdata/pg_auto_failover.");
+		return false;
+	}
+
 	keeperState->current_node_id = node_id;
 	keeperState->current_group = group_id;
 	keeperState->assigned_role = state;
@@ -246,6 +263,7 @@ keeper_ensure_current_state(Keeper *keeper)
 		}
 
 		case SECONDARY_STATE:
+		case REPORT_LSN_STATE:
 		{
 			bool updateRetries = false;
 
@@ -403,7 +421,7 @@ ReportPgIsRunning(Keeper *keeper)
  *  - We failed to obtain the replication state from pg_stat_replication
  */
 bool
-keeper_update_pg_state(Keeper *keeper)
+keeper_update_pg_state(Keeper *keeper, int logLevel)
 {
 	KeeperStateData *keeperState = &(keeper->state);
 	KeeperConfig *config = &(keeper->config);
@@ -415,6 +433,11 @@ keeper_update_pg_state(Keeper *keeper)
 
 	log_debug("Update local PostgreSQL state");
 
+	/* reinitialize the replication state values each time we update */
+	postgres->pgIsRunning = false;
+	memset(postgres->pgsrSyncState, 0, PGSR_SYNC_STATE_MAXLENGTH);
+	strlcpy(postgres->currentLSN, "0/0", sizeof(postgres->currentLSN));
+
 	/* when running with --disable-monitor, we might get here early */
 	if (keeperState->current_role == INIT_STATE)
 	{
@@ -422,11 +445,6 @@ keeper_update_pg_state(Keeper *keeper)
 	}
 
 	*pgSetup = config->pgSetup;
-
-	/* reinitialize the replication state values each time we update */
-	postgres->pgIsRunning = false;
-	memset(postgres->pgsrSyncState, 0, PGSR_SYNC_STATE_MAXLENGTH);
-	strlcpy(postgres->currentLSN, "0/0", sizeof(postgres->currentLSN));
 
 	/*
 	 * When PostgreSQL is running, do some extra checks that are going to be
@@ -475,13 +493,14 @@ keeper_update_pg_state(Keeper *keeper)
 										 postgres->currentLSN,
 										 &(pgSetup->control)))
 		{
-			log_error("Failed to update the local Postgres metadata");
+			log_level(logLevel, "Failed to update the local Postgres metadata");
 			return false;
 		}
 
 		if (!keeper_state_check_postgres(keeper, &(pgSetup->control)))
 		{
-			log_error("Failed to update the local Postgres metadata, "
+			log_level(logLevel,
+					  "Failed to update the local Postgres metadata, "
 					  "see above for details");
 			return false;
 		}
@@ -547,11 +566,13 @@ keeper_update_pg_state(Keeper *keeper)
 
 			if (IS_EMPTY_STRING_BUFFER(postgres->pgsrSyncState))
 			{
-				log_error("Failed to fetch current replication properties "
+				log_level(logLevel,
+						  "Failed to fetch current replication properties "
 						  "from standby node: no standby connected in "
 						  "pg_stat_replication.");
-				log_warn("HINT: check pg_autoctl and Postgres logs on "
-						 "standby nodes");
+				log_level(logLevel,
+						  "HINT: check pg_autoctl and Postgres logs on "
+						  "standby nodes");
 			}
 
 			return postgres->pgIsRunning &&
@@ -567,9 +588,10 @@ keeper_update_pg_state(Keeper *keeper)
 
 			if (!success)
 			{
-				log_warn("Postgres is %s and we are in state %s",
-						 postgres->pgIsRunning ? "running" : "not running",
-						 NodeStateToString(keeperState->current_role));
+				log_level(logLevel,
+						  "Postgres is %s and we are in state %s",
+						  postgres->pgIsRunning ? "running" : "not running",
+						  NodeStateToString(keeperState->current_role));
 			}
 			return success;
 		}
@@ -788,7 +810,7 @@ keeper_ensure_configuration(Keeper *keeper, bool postgresNotRunningIsOk)
 	 * options being found in our pg_autoctl configuration file or for other
 	 * reasons.
 	 */
-	if (!postgres_add_default_settings(postgres))
+	if (!postgres_add_default_settings(postgres, config->hostname))
 	{
 		log_warn("Failed to edit Postgres configuration after "
 				 "reloading pg_autoctl configuration, "
@@ -1074,7 +1096,7 @@ keeper_maintain_replication_slots(Keeper *keeper)
 	 */
 	if (bypass)
 	{
-		log_trace("Skipping replication slots on a secondary running %d",
+		log_debug("Skipping replication slots on a secondary running %d",
 				  pgSetup->control.pg_control_version);
 		return true;
 	}
@@ -1095,6 +1117,261 @@ keeper_maintain_replication_slots(Keeper *keeper)
 	}
 
 	return true;
+}
+
+
+/*
+ * keeper_node_active calls pgautofailover.node_active on the monitor.
+ */
+bool
+keeper_node_active(Keeper *keeper, bool doInit,
+				   MonitorAssignedState *assignedState)
+{
+	Monitor *monitor = &(keeper->monitor);
+	KeeperConfig *config = &(keeper->config);
+	KeeperStateData *keeperState = &(keeper->state);
+	LocalPostgresServer *postgres = &(keeper->postgres);
+
+	bool reportPgIsRunning = ReportPgIsRunning(keeper);
+
+	/*
+	 * First, connect to the monitor and check we're compatible with the
+	 * extension there. An upgrade on the monitor might have happened in
+	 * between loops here.
+	 *
+	 * Note that we don't need a very strong a guarantee about the version
+	 * number of the monitor extension, as we have other places in the code
+	 * that are protected against "suprises". The worst case would be a race
+	 * condition where the extension check passes, and then the monitor is
+	 * upgraded, and then we call node_active().
+	 *
+	 *  - The extension on the monitor is protected against running a version
+	 *    of the node_active (or any other) function that does not match with
+	 *    the SQL level version.
+	 *
+	 *  - Then, if we changed the API without changing the arguments, that
+	 *    means we changed what we may return. We are protected against changes
+	 *    in number of return values, so we're left with changes within the
+	 *    columns themselves. Basically that's a new state that we don't know
+	 *    how to handle. In that case we're going to fail to parse it, and at
+	 *    next attempt we're going to catch up with the new version number.
+	 *
+	 * All in all, the worst case is going to be one extra call before we
+	 * restart node active process, and an extra error message in the logs
+	 * during the live upgrade of pg_auto_failover.
+	 */
+	if (!keeper_check_monitor_extension_version(keeper))
+	{
+		/*
+		 * We could fail here for two different reasons:
+		 *
+		 * - if we failed to connect to the monitor (network split, monitor is
+		 *   in maintenance or being restarted, etc): in that case just return
+		 *   false and have the main loop handle the situation
+		 *
+		 * - if we could connect to the monitor and then failed to check that
+		 *   the version of the monitor is the one we expect, then we're not
+		 *   compatible with this monitor and that's a different story.
+		 */
+		if (monitor->pgsql.status != PG_CONNECTION_OK)
+		{
+			return false;
+		}
+
+		/*
+		 * Okay we're not compatible with the current version of the
+		 * pgautofailover extension on the monitor. The most plausible scenario
+		 * is that the monitor got update: we're still running e.g. 1.4 and the
+		 * monitor is running 1.5.
+		 *
+		 * In that case we exit, and because the keeper node-active service is
+		 * RP_PERMANENT the supervisor is going to restart this process. The
+		 * restart happens with fork() and exec(), so it uses the current
+		 * version of pg_autoctl binary on disk, which with luck has been
+		 * updated to e.g. 1.5 too.
+		 *
+		 * TL;DR: just exit now, have the service restarted by the supervisor
+		 * with the expected version of pg_autoctl that matches the monitor's
+		 * extension version.
+		 */
+		exit(EXIT_CODE_MONITOR);
+	}
+
+	if (doInit)
+	{
+		PostgresSetup *pgSetup = &(postgres->postgresSetup);
+		uint64_t system_identifier = pgSetup->control.system_identifier;
+
+		if (!monitor_set_group_system_identifier(monitor,
+												 keeperState->current_group,
+												 system_identifier))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	/* We used to output that in INFO every 5s, which is too much chatter */
+	log_debug("Calling node_active for node %s/%d/%d with current state: "
+			  "%s, "
+			  "PostgreSQL %s running, "
+			  "sync_state is \"%s\", "
+			  "current lsn is \"%s\".",
+			  config->formation,
+			  keeperState->current_node_id,
+			  keeperState->current_group,
+			  NodeStateToString(keeperState->current_role),
+			  reportPgIsRunning ? "is" : "is not",
+			  postgres->pgsrSyncState,
+			  postgres->currentLSN);
+
+	/* ensure we use the correct retry policy with the monitor */
+	(void) pgsql_set_main_loop_retry_policy(&(monitor->pgsql.retryPolicy));
+
+	/*
+	 * Report the current state to the monitor and get the assigned state.
+	 */
+	return monitor_node_active(monitor,
+							   config->formation,
+							   keeperState->current_node_id,
+							   keeperState->current_group,
+							   keeperState->current_role,
+							   reportPgIsRunning,
+							   postgres->postgresSetup.control.timeline_id,
+							   postgres->currentLSN,
+							   postgres->pgsrSyncState,
+							   assignedState);
+}
+
+
+/*
+ * keeper_ensure_node_has_been_dropped checks if the local node is being
+ * dropped or has been dropped already from the monitor, and when a drop has
+ * been engaged and is not finished, the function implements the remaining
+ * steps of the DROP protocol.
+ */
+bool
+keeper_ensure_node_has_been_dropped(Keeper *keeper, bool *dropped)
+{
+	Monitor *monitor = &(keeper->monitor);
+	KeeperConfig *config = &(keeper->config);
+	KeeperStateData *keeperState = &(keeper->state);
+
+	*dropped = false;
+
+	if (!keeper_state_read(keeperState, config->pathnames.state))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* ensure we use the correct retry policy with the monitor */
+	(void) pgsql_set_main_loop_retry_policy(&(monitor->pgsql.retryPolicy));
+
+	/* check if the nodeid still exists on the monitor */
+	NodeAddressArray nodesArray = { 0 };
+
+	if (!monitor_find_node_by_nodeid(monitor,
+									 config->formation,
+									 config->groupId,
+									 keeperState->current_node_id,
+									 &nodesArray))
+	{
+		log_error("Failed to query monitor to see if node id %d "
+				  "has been dropped already",
+				  keeperState->current_node_id);
+		return false;
+	}
+
+	log_debug("keeper_node_has_been_dropped: found %d node by id %d",
+			  nodesArray.count,
+			  keeperState->current_node_id);
+
+	if (nodesArray.count == 0)
+	{
+		/* no node found with our nodeid, the drop has been successfull */
+		*dropped = true;
+
+		/* if the monitor doesn't know about us, we're as good as DROPPED */
+		uint64_t now = time(NULL);
+
+		keeperState->last_monitor_contact = now;
+		keeperState->current_role = DROPPED_STATE;
+		keeperState->assigned_role = DROPPED_STATE;
+
+		return keeper_store_state(keeper);
+	}
+	else if (nodesArray.count == 1)
+	{
+		bool doInit = false;
+		MonitorAssignedState assignedState = { 0 };
+
+		/* grab our assigned state from the monitor now */
+		(void) keeper_update_pg_state(keeper, LOG_DEBUG);
+
+		if (!keeper_node_active(keeper, doInit, &assignedState))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (keeperState->current_role == DROPPED_STATE &&
+			assignedState.state == DROPPED_STATE)
+		{
+			*dropped = true;
+
+			uint64_t now = time(NULL);
+
+			keeperState->last_monitor_contact = now;
+			keeperState->current_role = DROPPED_STATE;
+			keeperState->assigned_role = assignedState.state;
+
+			return keeper_store_state(keeper);
+		}
+		else if (keeperState->current_role != DROPPED_STATE &&
+				 assignedState.state == DROPPED_STATE)
+		{
+			log_info("Reaching assigned state \"%s\"",
+					 NodeStateToString(assignedState.state));
+
+			if (!keeper_fsm_step(keeper))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			if (keeperState->current_role == DROPPED_STATE &&
+				keeperState->current_role == keeperState->assigned_role)
+			{
+				*dropped = true;
+
+				/*
+				 * Call node_active one last time now: after being assigned
+				 * DROPPED, we need to report we reached the state for the
+				 * monitor to actually drop this node.
+				 */
+				(void) keeper_update_pg_state(keeper, LOG_DEBUG);
+
+				if (!keeper_node_active(keeper, doInit, &assignedState))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+			}
+			return true;
+		}
+
+		/* we did all the checks we're supposed to, dropped is false */
+		return true;
+	}
+	else
+	{
+		log_error("BUG: monitor_find_node_by_nodeid returned %d nodes",
+				  nodesArray.count);
+		return false;
+	}
+
+	return false;
 }
 
 
@@ -1249,12 +1526,19 @@ keeper_register_and_init(Keeper *keeper, NodeState initialState)
 	 * may fail if we have no permission to write to the state file directory
 	 * or the disk is full. In that case, we stop before having registered the
 	 * local PostgreSQL node to the monitor.
+	 *
+	 * When using pg_autoctl create postgres on-top of a previously dropped
+	 * node, we already have a state file around and we're going to use some of
+	 * its content.
 	 */
-	if (!keeper_state_create_file(config->pathnames.state))
+	if (!file_exists(config->pathnames.state))
 	{
-		log_fatal("Failed to create a state file prior to registering the "
-				  "node with the monitor, see above for details");
-		return false;
+		if (!keeper_state_create_file(config->pathnames.state))
+		{
+			log_fatal("Failed to create a state file prior to registering the "
+					  "node with the monitor, see above for details");
+			return false;
+		}
 	}
 
 	/* now that we have a state on-disk, finish init of the keeper instance */
@@ -1262,7 +1546,6 @@ keeper_register_and_init(Keeper *keeper, NodeState initialState)
 	{
 		return false;
 	}
-
 
 	/*
 	 * We implement a specific retry policy for cases where we have a transient
@@ -1306,7 +1589,7 @@ keeper_register_and_init(Keeper *keeper, NodeState initialState)
 								  config->pgSetup.pgport,
 								  config->pgSetup.control.system_identifier,
 								  config->pgSetup.dbname,
-								  -1, /* desired nodeID */
+								  keeper->state.current_node_id,
 								  config->groupId,
 								  initialState,
 								  config->pgSetup.pgKind,
@@ -1388,6 +1671,22 @@ keeper_register_and_init(Keeper *keeper, NodeState initialState)
 		log_error("Failed to update the configuration file with the groupId: %d",
 				  assignedState.groupId);
 		goto rollback;
+	}
+
+	/*
+	 * If we dropped a primary using --force, it's possible that the postgres
+	 * state file still says that postgres should be running. In that case
+	 * postgres would probably be running now. The problem is that our
+	 * fsm_init_primary transation errors out when a postgres is running during
+	 * initialization. So if we were dropped and this is the first time
+	 * create is run after that, then we first stop postgres and record this
+	 * in our postgres state file.
+	 */
+	if (keeper->state.current_role == DROPPED_STATE &&
+		!file_exists(keeper->config.pathnames.init))
+	{
+		log_info("Making sure postgres was stopped, when it was previously dropped");
+		ensure_postgres_service_is_stopped(&keeper->postgres);
 	}
 
 	/*
@@ -1506,7 +1805,7 @@ keeper_register_again(Keeper *keeper)
 								  &assignedState))
 		{
 			/* registration was successful, break out of the retry loop */
-			log_info("Successfully registered to the monitor with nodeId %d",
+			log_info("Successfully registered to the monitor with nodeId %" PRId64,
 					 assignedState.nodeId);
 			registered = true;
 			break;
@@ -1591,12 +1890,15 @@ keeper_register_again(Keeper *keeper)
 			return false;
 		}
 
+		int currentTLI = keeper->postgres.postgresSetup.control.timeline_id;
+
 		if (!monitor_node_active(monitor,
 								 config->formation,
 								 assignedState.nodeId,
 								 assignedState.groupId,
 								 assignedState.state,
 								 ReportPgIsRunning(keeper),
+								 currentTLI,
 								 keeper->postgres.currentLSN,
 								 keeper->postgres.pgsrSyncState,
 								 &assignedState))
@@ -1638,71 +1940,6 @@ keeper_register_again(Keeper *keeper)
 	}
 
 	return true;
-}
-
-
-/*
- * keeper_remove removes the local node from the monitor and then removes the
- * local state file.
- */
-bool
-keeper_remove(Keeper *keeper, KeeperConfig *config)
-{
-	int errors = 0;
-
-	/*
-	 * We don't require keeper_init() to have been done before calling
-	 * keeper_remove, because then we would fail to finish a remove that was
-	 * half-done only: keeper_init loads the state from the state file, which
-	 * might not exists anymore.
-	 *
-	 * That said, we're going to require keeper->config to have been set the
-	 * usual way, so do that at least.
-	 */
-	keeper->config = *config;
-
-	if (!config->monitorDisabled)
-	{
-		if (!monitor_init(&(keeper->monitor), config->monitor_pguri))
-		{
-			return false;
-		}
-
-		log_info("Removing local node from the pg_auto_failover monitor.");
-
-		/*
-		 * If the node was already removed from the monitor, then the
-		 * monitor_remove function is going to return true here. It means that
-		 * we can call `pg_autoctl drop node` again when we removed the node
-		 * from the monitor already, but failed to remove the state file.
-		 */
-		if (!monitor_remove(&(keeper->monitor),
-							config->hostname,
-							config->pgSetup.pgport))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
-
-	log_info("Removing local node state file: \"%s\"", config->pathnames.state);
-
-	if (!unlink_file(config->pathnames.state))
-	{
-		/* we already logged about errors */
-		errors++;
-	}
-
-	log_info("Removing local node init state file: \"%s\"",
-			 config->pathnames.init);
-
-	if (!unlink_file(config->pathnames.init))
-	{
-		/* we already logged about errors */
-		errors++;
-	}
-
-	return errors == 0;
 }
 
 
@@ -1818,11 +2055,9 @@ keeper_refresh_other_nodes(Keeper *keeper, bool forceCacheInvalidation)
 	Monitor *monitor = &(keeper->monitor);
 	KeeperConfig *config = &(keeper->config);
 
-	NodeAddressArray *otherNodesArray = &(keeper->otherNodes);
 	NodeAddressArray newNodesArray = { 0 };
-	NodeAddressArray diffNodesArray = { 0 };
 
-	int nodeId = keeper->state.current_node_id;
+	int64_t nodeId = keeper->state.current_node_id;
 
 	log_trace("keeper_refresh_other_nodes");
 
@@ -1843,30 +2078,83 @@ keeper_refresh_other_nodes(Keeper *keeper, bool forceCacheInvalidation)
 		}
 	}
 
+	/*
+	 * In case of success, copy the current nodes array to the keeper's cache.
+	 */
+	bool success =
+		keeper_call_refresh_hooks(keeper, &newNodesArray, forceCacheInvalidation);
+
+	if (success)
+	{
+		keeper->otherNodes = newNodesArray;
+	}
+
+	return success;
+}
+
+
+/*
+ * keeper_call_refresh_hooks loops over the KeeperNodesArrayRefreshArray and
+ * calls each hook in turn. It returns true when all the hooks have returned
+ * true.
+ */
+bool
+keeper_call_refresh_hooks(Keeper *keeper,
+						  NodeAddressArray *newNodesArray,
+						  bool forceCacheInvalidation)
+{
+	bool success = true;
+
+	for (int index = 0; KeeperRefreshHooks[index]; index++)
+	{
+		KeeperNodesArrayRefreshFunction hookFun = KeeperRefreshHooks[index];
+
+		bool ret = (*hookFun)(keeper, newNodesArray, forceCacheInvalidation);
+
+		success = success && ret;
+	}
+
+	return success;
+}
+
+
+/*
+ * keeper_refresh_hba is a KeeperNodesArrayRefreshFunction that adds new
+ * entries in the Postgres HBA file for new nodes that have been added to our
+ * group.
+ */
+bool
+keeper_refresh_hba(Keeper *keeper,
+				   NodeAddressArray *newNodesArray,
+				   bool forceCacheInvalidation)
+{
+	NodeAddressArray *otherNodesArray = &(keeper->otherNodes);
+	NodeAddressArray diffNodesArray = { 0 };
+
 	/* compute nodes that need an HBA change (new ones, new hostnames) */
 	if (forceCacheInvalidation)
 	{
-		diffNodesArray = newNodesArray;
+		diffNodesArray = *newNodesArray;
 	}
 	else
 	{
-		(void) diff_nodesArray(otherNodesArray, &newNodesArray, &diffNodesArray);
+		(void) diff_nodesArray(otherNodesArray, newNodesArray, &diffNodesArray);
 	}
 
 	/*
 	 * When we're alone in the group, and also when there's no change, then we
 	 * are done here already.
 	 */
-	if (newNodesArray.count == 0 || diffNodesArray.count == 0)
+	if (newNodesArray->count == 0 || diffNodesArray.count == 0)
 	{
 		/* refresh the keeper's cache with the current other nodes array */
-		keeper->otherNodes = newNodesArray;
+		keeper->otherNodes = *newNodesArray;
 		return true;
 	}
 
 	log_info("Fetched current list of %d other nodes from the monitor "
 			 "to update HBA rules, including %d changes.",
-			 newNodesArray.count, diffNodesArray.count);
+			 newNodesArray->count, diffNodesArray.count);
 
 	/*
 	 * We have a new list of other nodes, update the HBA file. We only update
@@ -1881,11 +2169,6 @@ keeper_refresh_other_nodes(Keeper *keeper, bool forceCacheInvalidation)
 
 		return false;
 	}
-
-	/*
-	 * In case of success, copy the current nodes array to the keeper's cache.
-	 */
-	keeper->otherNodes = newNodesArray;
 
 	return true;
 }
@@ -1933,7 +2216,7 @@ diff_nodesArray(NodeAddressArray *previousNodesArray,
 			 */
 			if (!streq(currNode->host, prevNode->host))
 			{
-				log_debug("Node %d has a new hostname \"%s\"",
+				log_debug("Node %" PRId64 " has a new hostname \"%s\"",
 						  currNode->nodeId, currNode->host);
 
 				diffNodesArray->count++;
@@ -1989,7 +2272,7 @@ keeper_set_node_metadata(Keeper *keeper, KeeperConfig *oldConfig)
 		return false;
 	}
 
-	int nodeId = keeperState.current_node_id;
+	int64_t nodeId = keeperState.current_node_id;
 
 	if (streq(oldConfig->name, config->name) &&
 		streq(oldConfig->hostname, config->hostname) &&
@@ -2585,7 +2868,8 @@ keeper_get_most_advanced_standby(Keeper *keeper, NodeAddress *upstreamNode)
 
 			if (!parseLSN(node->lsn, &nodeLSN))
 			{
-				log_error("Failed to parse node %d \"%s\" LSN position \"%s\"",
+				log_error("Failed to parse node %" PRId64
+						  " \"%s\" LSN position \"%s\"",
 						  node->nodeId, node->name, node->lsn);
 				return false;
 			}

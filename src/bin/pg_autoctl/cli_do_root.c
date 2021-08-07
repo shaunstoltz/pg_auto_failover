@@ -129,6 +129,14 @@ CommandLine do_standby_rewind =
 				 keeper_cli_keeper_setup_getopts,
 				 keeper_cli_rewind_old_primary);
 
+CommandLine do_standby_crash_recovery =
+	make_command("crash-recovery",
+				 "Setup postgres for crash-recovery and start postgres",
+				 " [ --pgdata ... ]",
+				 KEEPER_CLI_WORKER_SETUP_OPTIONS,
+				 keeper_cli_keeper_setup_getopts,
+				 keeper_cli_maybe_do_crash_recovery);
+
 CommandLine do_standby_promote =
 	make_command("promote",
 				 "Promote a standby server to become writable",
@@ -140,6 +148,7 @@ CommandLine do_standby_promote =
 CommandLine *do_standby[] = {
 	&do_standby_init,
 	&do_standby_rewind,
+	&do_standby_crash_recovery,
 	&do_standby_promote,
 	NULL
 };
@@ -223,7 +232,8 @@ CommandLine do_tmux_script =
 				 "  --node-priorities list of nodes priorities (50)\n"
 				 "  --sync-standbys   number-sync-standbys to set (0 or 1)\n"
 				 "  --skip-pg-hba     use --skip-pg-hba when creating nodes\n"
-				 "  --layout          tmux layout to use (even-vertical)",
+				 "  --layout          tmux layout to use (even-vertical)\n"
+				 "  --binpath         path to the pg_autoctl binary (current binary path)",
 				 cli_do_tmux_script_getopts,
 				 cli_do_tmux_script);
 
@@ -238,7 +248,8 @@ CommandLine do_tmux_session =
 				 "  --node-priorities list of nodes priorities (50)\n"
 				 "  --sync-standbys   number-sync-standbys to set (0 or 1)\n"
 				 "  --skip-pg-hba     use --skip-pg-hba when creating nodes\n"
-				 "  --layout          tmux layout to use (even-vertical)",
+				 "  --layout          tmux layout to use (even-vertical)\n"
+				 "  --binpath         path to the pg_autoctl binary (current binary path)",
 				 cli_do_tmux_script_getopts,
 				 cli_do_tmux_session);
 

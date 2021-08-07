@@ -6,6 +6,7 @@
  * Licensed under the PostgreSQL License.
  *
  */
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -88,6 +89,7 @@ GUC citus_default_settings_pre_13[] = {
 	{ "citus.node_conninfo", "'sslmode=prefer'" },
 	{ "citus.cluster_name", "'default'" },
 	{ "citus.use_secondary_nodes", "'never'" },
+	{ "citus.local_hostname", "'localhost'" },
 	{ NULL, NULL }
 };
 
@@ -97,6 +99,7 @@ GUC citus_default_settings_13[] = {
 	{ "citus.node_conninfo", "'sslmode=prefer'" },
 	{ "citus.cluster_name", "'default'" },
 	{ "citus.use_secondary_nodes", "'never'" },
+	{ "citus.local_hostname", "'localhost'" },
 	{ NULL, NULL }
 };
 
@@ -592,14 +595,17 @@ primary_disable_synchronous_replication(LocalPostgresServer *postgres)
  * settings related to streaming replication and running pg_auto_failover.
  */
 bool
-postgres_add_default_settings(LocalPostgresServer *postgres)
+postgres_add_default_settings(LocalPostgresServer *postgres,
+							  const char *hostname)
 {
 	PGSQL *pgsql = &(postgres->sqlClient);
 	PostgresSetup *pgSetup = &(postgres->postgresSetup);
 	char configFilePath[MAXPGPATH];
 	GUC *default_settings = NULL;
 
-	log_trace("postgres_add_default_settings");
+	log_trace("postgres_add_default_settings (%s) [%d]",
+			  nodeKindToString(postgres->pgKind),
+			  pgSetup->control.pg_control_version);
 
 	/* configFilePath = $PGDATA/postgresql.conf */
 	join_path_components(configFilePath, pgSetup->pgdata, "postgresql.conf");
@@ -651,6 +657,7 @@ postgres_add_default_settings(LocalPostgresServer *postgres)
 	}
 
 	if (!pg_add_auto_failover_default_settings(pgSetup,
+											   hostname,
 											   configFilePath,
 											   default_settings))
 	{
@@ -749,15 +756,15 @@ primary_create_replication_user(LocalPostgresServer *postgres,
 
 /*
  * standby_init_replication_source initializes a replication source structure
- * with given arguments. If the primaryNode is NULL, then the
+ * with given arguments. If the upstreamNode is NULL, then the
  * replicationSource.primary structure slot is not updated.
  *
  * Note that we just store the pointers to all those const char *arguments
- * here, expect for the primaryNode there's no copying involved.
+ * here, expect for the upstreamNode there's no copying involved.
  */
 bool
 standby_init_replication_source(LocalPostgresServer *postgres,
-								NodeAddress *primaryNode,
+								NodeAddress *upstreamNode,
 								const char *username,
 								const char *password,
 								const char *slotName,
@@ -769,17 +776,17 @@ standby_init_replication_source(LocalPostgresServer *postgres,
 {
 	ReplicationSource *upstream = &(postgres->replicationSource);
 
-	if (primaryNode != NULL)
+	if (upstreamNode != NULL)
 	{
-		upstream->primaryNode.nodeId = primaryNode->nodeId;
+		upstream->primaryNode.nodeId = upstreamNode->nodeId;
 
 		strlcpy(upstream->primaryNode.name,
-				primaryNode->name, _POSIX_HOST_NAME_MAX);
+				upstreamNode->name, _POSIX_HOST_NAME_MAX);
 
 		strlcpy(upstream->primaryNode.host,
-				primaryNode->host, _POSIX_HOST_NAME_MAX);
+				upstreamNode->host, _POSIX_HOST_NAME_MAX);
 
-		upstream->primaryNode.port = primaryNode->port;
+		upstream->primaryNode.port = upstreamNode->port;
 	}
 
 	strlcpy(upstream->userName, username, NAMEDATALEN);
@@ -868,7 +875,15 @@ standby_init_database(LocalPostgresServer *postgres,
 		 */
 		bool hasReplicationSlot = false;
 
-		if (!upstream_has_replication_slot(upstream,
+		/*
+		 * When initialising from another standby (in REPORT_LSN, if there is
+		 * currently no primary node and no candidate node either), we don't
+		 * require a replication slot on the upstream node.
+		 */
+		bool needsReplicationSlot = !IS_EMPTY_STRING_BUFFER(upstream->slotName);
+
+		if (needsReplicationSlot &&
+			!upstream_has_replication_slot(upstream,
 										   pgSetup,
 										   &hasReplicationSlot))
 		{
@@ -876,7 +891,7 @@ standby_init_database(LocalPostgresServer *postgres,
 			return false;
 		}
 
-		if (hasReplicationSlot)
+		if (!needsReplicationSlot || hasReplicationSlot)
 		{
 			/* first, make sure we can connect with "replication" */
 			if (!pgctl_identify_system(upstream))
@@ -894,8 +909,8 @@ standby_init_database(LocalPostgresServer *postgres,
 		}
 		else
 		{
-			log_error("The replication slot \"%s\" has not been created "
-					  "on the primary node %d \"%s\" (%s:%d) yet",
+			log_error("The replication slot \"%s\" has not been created yet "
+					  "on the primary node " NODE_FORMAT,
 					  upstream->slotName,
 					  upstream->primaryNode.nodeId,
 					  upstream->primaryNode.name,
@@ -948,7 +963,7 @@ standby_init_database(LocalPostgresServer *postgres,
 	 * key and cert locations. By changing this before starting postgres these
 	 * new settings will automatically be applied.
 	 */
-	if (!postgres_add_default_settings(postgres))
+	if (!postgres_add_default_settings(postgres, hostname))
 	{
 		log_error("Failed to add default settings to the secondary, "
 				  "see above for details.");
@@ -978,7 +993,7 @@ primary_rewind_to_standby(LocalPostgresServer *postgres)
 	NodeAddress *primaryNode = &(replicationSource->primaryNode);
 
 	log_trace("primary_rewind_to_standby");
-	log_info("Rewinding PostgreSQL to follow new primary node %d \"%s\" (%s:%d)",
+	log_info("Rewinding PostgreSQL to follow new primary node " NODE_FORMAT,
 			 primaryNode->nodeId,
 			 primaryNode->name,
 			 primaryNode->host,
@@ -988,6 +1003,25 @@ primary_rewind_to_standby(LocalPostgresServer *postgres)
 	{
 		log_error("Failed to stop postgres to do rewind");
 		return false;
+	}
+
+	if (!postgres_maybe_do_crash_recovery(postgres))
+	{
+		log_error("Failed to implement Postgres crash recovery "
+				  "before calling pg_rewind");
+		return false;
+	}
+
+	/* before pg_rewind, make sure we can connect with "replication" */
+	if (!pgctl_identify_system(replicationSource))
+	{
+		log_error("Failed to connect to the primary node " NODE_FORMAT
+				  "with a replication connection string. "
+				  "See above for details",
+				  primaryNode->nodeId,
+				  primaryNode->name,
+				  primaryNode->host,
+				  primaryNode->port);
 	}
 
 	if (!pg_rewind(pgSetup->pgdata, pgSetup->pg_ctl, replicationSource))
@@ -1009,6 +1043,209 @@ primary_rewind_to_standby(LocalPostgresServer *postgres)
 	{
 		log_error("Failed to start postgres after rewind");
 		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * postgres_maybe_do_crash_recovery implements a round of Postgres crash
+ * recovery for the local instance of Postgres when pg_rewind would otherwise
+ * fail because of its internal checks.
+ */
+bool
+postgres_maybe_do_crash_recovery(LocalPostgresServer *postgres)
+{
+	PostgresSetup *pgSetup = &(postgres->postgresSetup);
+	ReplicationSource *replicationSource = &(postgres->replicationSource);
+
+	LocalExpectedPostgresStatus *pgStatus = &(postgres->expectedPgStatus);
+
+	/* update our service controller for Postgres to release control */
+	if (!keeper_set_postgres_state_unknown(&(pgStatus->state),
+										   pgStatus->pgStatusPath))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* we don't log the output for pg_ctl_status here */
+	int status = pg_ctl_status(pgSetup->pg_ctl, pgSetup->pgdata, false);
+
+	if (status != PG_CTL_STATUS_NOT_RUNNING)
+	{
+		log_error("Failed to prepare for crash recovery: "
+				  "Postgres is not stopped");
+		return false;
+	}
+
+	/*
+	 * pg_rewind fails when the target cluster (meaning the local Postgres
+	 * instance) is either running or has not been shutdown correctly. Time to
+	 * use pg_controldata and see if the DBState there is to pg_rewind liking.
+	 */
+	const bool missingPgdataIsOk = false;
+
+	if (!pg_controldata(pgSetup, missingPgdataIsOk))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * We know that Postgres is not running thanks to pg_ctl_status, and we
+	 * just grabbed the output from pg_controldata. We can now implement the
+	 * same pre-condition checks as in Postgres pg_rewind.c.
+	 */
+	if (pgSetup->control.state != DB_SHUTDOWNED &&
+		pgSetup->control.state != DB_SHUTDOWNED_IN_RECOVERY)
+	{
+		/*
+		 * Before calling pg_rewind, attempt crash recovery on the Postgres
+		 * instance and then shutdown.
+		 */
+		ReplicationSource crashRecoveryReplicationSource = { 0 };
+
+		log_info("Postgres needs to enter crash recovery before pg_rewind.");
+
+		crashRecoveryReplicationSource = *replicationSource;
+
+		/* we target the earlier consistent state possible, or 'immediate' */
+		strlcpy(crashRecoveryReplicationSource.targetLSN,
+				"immediate",
+				sizeof(crashRecoveryReplicationSource.targetLSN));
+
+		/* pause when reaching target to avoid creating a new local timeline */
+		strlcpy(crashRecoveryReplicationSource.targetAction,
+				"pause",
+				sizeof(crashRecoveryReplicationSource.targetAction));
+
+		strlcpy(crashRecoveryReplicationSource.targetTimeline,
+				"current",
+				sizeof(crashRecoveryReplicationSource.targetTimeline));
+
+		if (!pg_setup_standby_mode(pgSetup->control.pg_control_version,
+								   pgSetup->pgdata,
+								   pgSetup->pg_ctl,
+								   &crashRecoveryReplicationSource))
+		{
+			log_error("Failed to setup for crash recovery "
+					  "in preparation for pg_rewind");
+			return false;
+		}
+
+		/*
+		 * Now that the configuration file is ready and asks for Postgres
+		 * shutdown when reaching crash recovery time, we start postgres as a
+		 * sub-process here and wait for it to terminate.
+		 */
+		fflush(stdout);
+		fflush(stderr);
+
+		/* time to create the node_active sub-process */
+		pid_t fpid = fork();
+
+		switch (fpid)
+		{
+			case -1:
+			{
+				log_error("Failed to fork the postgres supervisor process");
+				return false;
+			}
+
+			case 0:
+			{
+				/* execv() the postgres binary directly, as a sub-process */
+				(void) pg_ctl_postgres(pgSetup->pg_ctl,
+									   pgSetup->pgdata,
+									   pgSetup->pgport,
+									   pgSetup->listen_addresses,
+
+				                       /* do not open the service just yet */
+									   false);
+
+				/* unexpected */
+				log_fatal("BUG: returned from service_keeper_runprogram()");
+				exit(EXIT_CODE_INTERNAL_ERROR);
+			}
+
+			default:
+			{
+				/* wait until postgres crash recovery is done */
+				for (int attempts = 0;; attempts++)
+				{
+					int timeout = 30;
+
+					if (pg_setup_wait_until_is_ready(pgSetup, timeout, LOG_INFO))
+					{
+						break;
+					}
+				}
+
+				/* get Postgres current LSN after recovery, might be useful */
+				PGSQL *pgsql = &(postgres->sqlClient);
+
+				if (pgsql_get_postgres_metadata(pgsql,
+												&pgSetup->is_in_recovery,
+												postgres->pgsrSyncState,
+												postgres->currentLSN,
+												&(pgSetup->control)))
+				{
+					log_info("Postgres has finished crash recovery at LSN %s",
+							 postgres->currentLSN);
+				}
+				else
+				{
+					log_error("Failed to get Postgres metadata, continuing");
+				}
+
+
+				/*
+				 * Now stop Postgres by just killing our child process, and
+				 * wait until the child process has finished with waitpid().
+				 */
+				int wpid, status;
+
+				do {
+					if (kill(fpid, SIGTERM) != 0)
+					{
+						log_error("Failed to send SIGTERM to "
+								  "Postgres pid %d: %m", fpid);
+						return false;
+					}
+
+					wpid = waitpid(fpid, &status, WNOHANG);
+
+					if (wpid == -1)
+					{
+						log_warn("Failed to wait until Postgres is done: %m");
+					}
+
+					/* waitpid could be WIFSTOPPED, then try again */
+				} while (!(WIFEXITED(status) || !WIFSIGNALED(status)));
+
+				if (WIFEXITED(status) && WEXITSTATUS(status) == EXIT_CODE_QUIT)
+				{
+					return true;
+				}
+				else if (WIFEXITED(status))
+				{
+					int returnCode = WEXITSTATUS(status);
+
+					log_warn("Postgres has finished crash recovery with "
+							 "exit code %d",
+							 returnCode);
+
+					(void) pg_log_startup(pgSetup->pgdata, LOG_INFO);
+				}
+				else
+				{
+					log_error("BUG: can't make sense of waitpid() exit code");
+					return false;
+				}
+			}
+		}
 	}
 
 	return true;
@@ -1065,6 +1302,14 @@ standby_promote(LocalPostgresServer *postgres)
 	do {
 		log_info("Waiting for postgres to promote");
 		pg_usleep(AWAIT_PROMOTION_SLEEP_TIME_MS * 1000);
+
+		if (asked_to_stop || asked_to_stop_fast)
+		{
+			log_trace("standby_promote: signaled");
+			pgsql_finish(pgsql);
+
+			return false;
+		}
 
 		if (!pgsql_is_in_recovery(pgsql, &inRecovery))
 		{
@@ -1186,7 +1431,7 @@ standby_follow_new_primary(LocalPostgresServer *postgres)
 	ReplicationSource *replicationSource = &(postgres->replicationSource);
 	NodeAddress *primaryNode = &(replicationSource->primaryNode);
 
-	log_info("Follow new primary node %d \"%s\" (%s:%d)",
+	log_info("Follow new primary node " NODE_FORMAT,
 			 primaryNode->nodeId,
 			 primaryNode->name,
 			 primaryNode->host,
@@ -1264,7 +1509,8 @@ standby_fetch_missing_wal(LocalPostgresServer *postgres)
 	char currentLSN[PG_LSN_MAXLENGTH] = { 0 };
 	bool hasReachedLSN = false;
 
-	log_info("Fetching WAL from upstream node %d \"%s\" (%s:%d) up to LSN %s",
+	log_info("Fetching WAL from upstream node " NODE_FORMAT
+			 "up to LSN %s",
 			 upstreamNode->nodeId,
 			 upstreamNode->name,
 			 upstreamNode->host,
@@ -1275,7 +1521,8 @@ standby_fetch_missing_wal(LocalPostgresServer *postgres)
 	if (!standby_restart_with_current_replication_source(postgres))
 	{
 		log_error("Failed to setup replication "
-				  "from upstream node %d \"%s\" (%s:%d), see above for details",
+				  "from upstream node " NODE_FORMAT
+				  ", see above for details",
 				  upstreamNode->nodeId,
 				  upstreamNode->name,
 				  upstreamNode->host,
@@ -1434,4 +1681,92 @@ standby_cleanup_as_primary(LocalPostgresServer *postgres)
 	}
 
 	return true;
+}
+
+
+/*
+ * standby_check_timeline_with_upstream returns true when the current timeline
+ * on the local node (a standby) is the same as the timeline fetched on the
+ * upstream node setup in its replicationSource.
+ */
+bool
+standby_check_timeline_with_upstream(LocalPostgresServer *postgres)
+{
+	ReplicationSource *replicationSource = &(postgres->replicationSource);
+	NodeAddress *primaryNode = &(replicationSource->primaryNode);
+
+	/* fetch timeline information from the upstream node */
+	if (!pgctl_identify_system(replicationSource))
+	{
+		log_error("Failed to establish a replication connection "
+				  "to the new primary, see above for details");
+		return false;
+	}
+
+	/* fetch most recent local metadata, including the timeline id. */
+	if (!pgsql_get_postgres_metadata(&(postgres->sqlClient),
+									 &(postgres->postgresSetup.is_in_recovery),
+									 postgres->pgsrSyncState,
+									 postgres->currentLSN,
+									 &(postgres->postgresSetup.control)))
+	{
+		log_error("Failed to update the local Postgres metadata");
+		return false;
+	}
+
+	uint32_t upstreamTimeline = replicationSource->system.timeline;
+	uint32_t localTimeline = postgres->postgresSetup.control.timeline_id;
+
+	/* we might not be connected to the primary yet */
+	if (localTimeline == 0)
+	{
+		log_warn("Current received timeline is unknown, pg_autoctl will "
+				 "retry this transition.");
+		return false;
+	}
+
+	/*
+	 * We only allow this transition when the standby node as caught-up with
+	 * the upstream timeline. As streaming replication is supposed to be a
+	 * clean history replay (no PITR shenanigans), it is never expected that
+	 * the local timeline would be greater than the timeline found on the
+	 * upstream node.
+	 */
+	if (upstreamTimeline < localTimeline)
+	{
+		log_error("Current timeline on upstream node " NODE_FORMAT
+				  " is %d, and current timeline on this standby node is %d",
+				  primaryNode->nodeId,
+				  primaryNode->name,
+				  primaryNode->host,
+				  primaryNode->port,
+				  upstreamTimeline,
+				  localTimeline);
+
+		return false;
+	}
+	else if (upstreamTimeline > localTimeline)
+	{
+		log_warn("Current timeline on upstream node " NODE_FORMAT
+				 " is %d, and current timeline on this standby node is still %d",
+				 primaryNode->nodeId,
+				 primaryNode->name,
+				 primaryNode->host,
+				 primaryNode->port,
+				 upstreamTimeline,
+				 localTimeline);
+
+		return false;
+	}
+	else if (upstreamTimeline == localTimeline)
+	{
+		log_info("Reached timeline %d, same as upstream node " NODE_FORMAT,
+				 localTimeline,
+				 primaryNode->nodeId,
+				 primaryNode->name,
+				 primaryNode->host,
+				 primaryNode->port);
+	}
+
+	return upstreamTimeline == localTimeline;
 }

@@ -38,7 +38,8 @@ bool set_pg_ctl_from_config_bindir(PostgresSetup *pgSetup, const char *pg_config
 bool find_pg_config_from_pg_ctl(const char *pg_ctl, char *pg_config, size_t size);
 
 bool pg_add_auto_failover_default_settings(PostgresSetup *pgSetup,
-										   char *configFilePath,
+										   const char *hostname,
+										   const char *configFilePath,
 										   GUC *settings);
 
 bool pg_auto_failover_default_settings_file_exists(PostgresSetup *pgSetup);
@@ -52,7 +53,7 @@ bool pg_rewind(const char *pgdata,
 
 bool pg_ctl_initdb(const char *pg_ctl, const char *pgdata);
 bool pg_ctl_postgres(const char *pg_ctl, const char *pgdata, int pgport,
-					 char *listen_addresses);
+					 char *listen_addresses, bool listen);
 bool pg_log_startup(const char *pgdata, int logLevel);
 bool pg_log_recovery_setup(const char *pgdata, int logLevel);
 bool pg_ctl_stop(const char *pg_ctl, const char *pgdata);

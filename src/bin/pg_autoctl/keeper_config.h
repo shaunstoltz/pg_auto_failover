@@ -66,6 +66,7 @@ typedef struct KeeperConfig
 	int prepare_promotion_walreceiver;
 	int postgresql_restart_failure_timeout;
 	int postgresql_restart_failure_max_retries;
+	int listen_notifications_timeout;
 } KeeperConfig;
 
 #define PG_AUTOCTL_MONITOR_IS_DISABLED(config) \
@@ -100,7 +101,7 @@ bool keeper_config_set_setting(KeeperConfig *config,
 							   char *value);
 
 bool keeper_config_merge_options(KeeperConfig *config, KeeperConfig *options);
-bool keeper_config_update(KeeperConfig *config, int nodeId, int groupId);
+bool keeper_config_update(KeeperConfig *config, int64_t nodeId, int groupId);
 bool keeper_config_update_with_absolute_pgdata(KeeperConfig *config);
 
 #endif /* KEEPER_CONFIG_H */

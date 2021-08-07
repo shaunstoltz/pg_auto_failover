@@ -62,9 +62,8 @@ static bool disableAutoStart(PostgresConfigFiles *pgConfigFiles);
  * them from default location and modifies paths inside copied postgresql.conf.
  */
 bool
-keeper_ensure_pg_configuration_files_in_pgdata(KeeperConfig *config)
+keeper_ensure_pg_configuration_files_in_pgdata(PostgresSetup *pgSetup)
 {
-	PostgresSetup *pgSetup = &(config->pgSetup);
 	PostgresConfigFiles pgConfigFiles = { 0 };
 
 	if (!debian_find_postgres_configuration_files(pgSetup, &pgConfigFiles))
@@ -176,15 +175,24 @@ debian_find_postgres_configuration_files(PostgresSetup *pgSetup,
 		return true;
 	}
 
-	/* is it a debian postgres-common style setup then? */
-	if (debian_init_postgres_config_files(pgSetup,
-										  &debianConfFiles,
-										  PG_CONFIG_TYPE_DEBIAN))
+	/*
+	 * Is it a debian postgresql-common style setup then?
+	 *
+	 * We only search for debian style setup when the main postgresql.conf file
+	 * was not found. The previous call to debian_init_postgres_config_files
+	 * might see a partial failure because of e.g. missing only pg_ident.conf.
+	 */
+	if (!file_exists(postgresConfFiles.conf))
 	{
-		/* so we're dealing with a "normal" Postgres installation */
-		*pgConfigFiles = debianConfFiles;
+		if (debian_init_postgres_config_files(pgSetup,
+											  &debianConfFiles,
+											  PG_CONFIG_TYPE_DEBIAN))
+		{
+			/* so we're dealing with a "debian style" Postgres installation */
+			*pgConfigFiles = debianConfFiles;
 
-		return true;
+			return true;
+		}
 	}
 
 	/* well that's all we know how to detect at this point */
@@ -219,21 +227,7 @@ debian_init_postgres_config_files(PostgresSetup *pgSetup,
 			initPostgresConfigFiles(pgdata, pgConfigFiles,
 									PG_CONFIG_TYPE_POSTGRES);
 
-			if (postgresConfigFilesAllExist(pgConfigFiles))
-			{
-				return true;
-			}
-			else
-			{
-				/*
-				 * WARN the user about the unexpected nature of our setup here,
-				 * even if we then move on to make it the way we expect it.
-				 */
-				log_warn("Failed to find Postgres configuration files in PGDATA, "
-						 "as expected: \"%s\" does not exists",
-						 pgConfigFiles->conf);
-				return false;
-			}
+			return postgresConfigFilesAllExist(pgConfigFiles);
 		}
 
 		case PG_CONFIG_TYPE_DEBIAN:
@@ -252,21 +246,7 @@ debian_init_postgres_config_files(PostgresSetup *pgSetup,
 			initPostgresConfigFiles(debPathnames.confDirectory,
 									pgConfigFiles, PG_CONFIG_TYPE_DEBIAN);
 
-			if (postgresConfigFilesAllExist(pgConfigFiles))
-			{
-				return true;
-			}
-			else
-			{
-				/*
-				 * WARN the user about the unexpected nature of our setup here,
-				 * even if we then move on to make it the way we expect it.
-				 */
-				log_warn("Failed to find Postgres configuration files in PGDATA, "
-						 "as expected: \"%s\" does not exists",
-						 pgConfigFiles->conf);
-				return false;
-			}
+			return postgresConfigFilesAllExist(pgConfigFiles);
 		}
 	}
 
@@ -502,6 +482,31 @@ initPostgresConfigFiles(const char *dirname,
 static bool
 postgresConfigFilesAllExist(PostgresConfigFiles *pgConfigFiles)
 {
+	/*
+	 * WARN the user about the unexpected nature of our setup here, even if we
+	 * then move on to make it the way we expect it.
+	 */
+	if (!file_exists(pgConfigFiles->conf))
+	{
+		log_warn("Failed to find Postgres configuration files in PGDATA, "
+				 "as expected: \"%s\" does not exists",
+				 pgConfigFiles->conf);
+	}
+
+	if (!file_exists(pgConfigFiles->ident))
+	{
+		log_warn("Failed to find Postgres configuration files in PGDATA, "
+				 "as expected: \"%s\" does not exists",
+				 pgConfigFiles->ident);
+	}
+
+	if (!file_exists(pgConfigFiles->hba))
+	{
+		log_warn("Failed to find Postgres configuration files in PGDATA, "
+				 "as expected: \"%s\" does not exists",
+				 pgConfigFiles->hba);
+	}
+
 	return file_exists(pgConfigFiles->conf) &&
 		   file_exists(pgConfigFiles->ident) &&
 		   file_exists(pgConfigFiles->hba);

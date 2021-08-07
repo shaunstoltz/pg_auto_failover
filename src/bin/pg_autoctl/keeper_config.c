@@ -7,6 +7,7 @@
  *
  */
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <unistd.h>
 
@@ -176,6 +177,12 @@
 							&(config->postgresql_restart_failure_max_retries), \
 							POSTGRESQL_FAILS_TO_START_RETRIES)
 
+#define OPTION_TIMEOUT_LISTEN_NOTIFICATIONS(config) \
+	make_int_option_default("timeout", "listen_notifications_timeout", \
+							NULL, false, \
+							&(config->listen_notifications_timeout), \
+							PG_AUTOCTL_LISTEN_NOTIFICATIONS_TIMEOUT)
+
 #define OPTION_CITUS_ROLE(config) \
 	make_strbuf_option_default("citus", "role", NULL, false, NAMEDATALEN, \
 							   config->citusRoleStr, DEFAULT_CITUS_ROLE)
@@ -219,6 +226,7 @@
 		OPTION_TIMEOUT_PREPARE_PROMOTION_WALRECEIVER(config), \
 		OPTION_TIMEOUT_POSTGRESQL_RESTART_FAILURE_TIMEOUT(config), \
 		OPTION_TIMEOUT_POSTGRESQL_RESTART_FAILURE_MAX_RETRIES(config), \
+		OPTION_TIMEOUT_LISTEN_NOTIFICATIONS(config), \
  \
 		OPTION_CITUS_ROLE(config), \
 		OPTION_CITUS_CLUSTER_NAME(config), \
@@ -227,7 +235,8 @@
 
 static bool keeper_config_init_nodekind(KeeperConfig *config);
 static bool keeper_config_init_hbalevel(KeeperConfig *config);
-static bool keeper_config_set_backup_directory(KeeperConfig *config, int nodeId);
+static bool keeper_config_set_backup_directory(KeeperConfig *config,
+											   int64_t nodeId);
 
 
 /*
@@ -704,7 +713,7 @@ keeper_config_merge_options(KeeperConfig *config, KeeperConfig *options)
  * replication slot name and our backup directory using the nodeId.
  */
 bool
-keeper_config_update(KeeperConfig *config, int nodeId, int groupId)
+keeper_config_update(KeeperConfig *config, int64_t nodeId, int groupId)
 {
 	config->groupId = groupId;
 
@@ -805,7 +814,7 @@ keeper_config_init_hbalevel(KeeperConfig *config)
  * ${PGDATA/../backup/node_${nodeId} instead.
  */
 static bool
-keeper_config_set_backup_directory(KeeperConfig *config, int nodeId)
+keeper_config_set_backup_directory(KeeperConfig *config, int64_t nodeId)
 {
 	char *pgdata = config->pgSetup.pgdata;
 	char subdirs[MAXPGPATH] = { 0 };
@@ -834,7 +843,7 @@ keeper_config_set_backup_directory(KeeperConfig *config, int nodeId)
 		/* we might be able to use the nodeId, better than the hostname */
 		if (nodeId > 0)
 		{
-			sformat(subdirs, MAXPGPATH, "backup/node_%d", nodeId);
+			sformat(subdirs, MAXPGPATH, "backup/node_%" PRId64, nodeId);
 			path_in_same_directory(pgdata, subdirs, backupDirectory);
 		}
 

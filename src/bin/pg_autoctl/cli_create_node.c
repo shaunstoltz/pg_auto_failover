@@ -1,5 +1,5 @@
 /*
- * src/bin/pg_autoctl/cli_create_drop_node.c
+ * src/bin/pg_autoctl/cli_create_node.c
  *     Implementation of the pg_autoctl create and pg_autoctl drop CLI for the
  *     pg_auto_failover nodes (monitor, coordinator, worker, postgres).
  *
@@ -45,21 +45,12 @@
  * functions and their command implementation. We can't pass parameters around.
  */
 MonitorConfig monitorOptions = { 0 };
-static bool dropAndDestroy = false;
 
 static int cli_create_postgres_getopts(int argc, char **argv);
 static void cli_create_postgres(int argc, char **argv);
 
 static int cli_create_monitor_getopts(int argc, char **argv);
 static void cli_create_monitor(int argc, char **argv);
-
-static int cli_drop_node_getopts(int argc, char **argv);
-static void cli_drop_node(int argc, char **argv);
-static void cli_drop_monitor(int argc, char **argv);
-
-static void cli_drop_node_from_monitor(KeeperConfig *config,
-									   const char *hostname,
-									   int port);
 
 static void check_hostname(const char *hostname);
 
@@ -104,25 +95,6 @@ CommandLine create_postgres_command =
 		cli_create_postgres_getopts,
 		cli_create_postgres);
 
-CommandLine drop_monitor_command =
-	make_command("monitor",
-				 "Drop the pg_auto_failover monitor",
-				 "[ --pgdata --destroy ]",
-				 "  --pgdata      path to data directory\n"
-				 "  --destroy     also destroy Postgres database\n",
-				 cli_drop_node_getopts,
-				 cli_drop_monitor);
-
-CommandLine drop_node_command =
-	make_command("node",
-				 "Drop a node from the pg_auto_failover monitor",
-				 "[ --pgdata --destroy --hostname --pgport ]",
-				 "  --pgdata      path to data directory\n"
-				 "  --destroy     also destroy Postgres database\n"
-				 "  --hostname    hostname to remove from the monitor\n"
-				 "  --pgport      Postgres port of the node to remove",
-				 cli_drop_node_getopts,
-				 cli_drop_node);
 
 /*
  * cli_create_config manages the whole set of configuration parameters that
@@ -147,7 +119,7 @@ cli_create_config(Keeper *keeper)
 	if (file_exists(config->pathnames.config))
 	{
 		Monitor *monitor = &(keeper->monitor);
-		KeeperConfig options = *config;
+		KeeperConfig options = { 0 };
 		KeeperConfig oldConfig = { 0 };
 		PostgresSetup optionsFullPgSetup = { 0 };
 
@@ -162,6 +134,7 @@ cli_create_config(Keeper *keeper)
 		}
 
 		oldConfig = *config;
+		options = *config;
 
 		/*
 		 * Before merging command line options into the (maybe) pre-existing
@@ -843,347 +816,6 @@ cli_create_monitor(int argc, char **argv)
 	{
 		/* errors have been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-}
-
-
-/*
- * cli_drop_node_getopts parses the command line options necessary to drop or
- * destroy a local pg_autoctl node.
- */
-static int
-cli_drop_node_getopts(int argc, char **argv)
-{
-	KeeperConfig options = { 0 };
-	int c, option_index = 0;
-	int verboseCount = 0;
-
-	static struct option long_options[] = {
-		{ "pgdata", required_argument, NULL, 'D' },
-		{ "destroy", no_argument, NULL, 'd' },
-		{ "hostname", required_argument, NULL, 'n' },
-		{ "pgport", required_argument, NULL, 'p' },
-		{ "version", no_argument, NULL, 'V' },
-		{ "verbose", no_argument, NULL, 'v' },
-		{ "quiet", no_argument, NULL, 'q' },
-		{ "help", no_argument, NULL, 'h' },
-		{ NULL, 0, NULL, 0 }
-	};
-
-	optind = 0;
-
-	while ((c = getopt_long(argc, argv, "D:dn:p:Vvqh",
-							long_options, &option_index)) != -1)
-	{
-		switch (c)
-		{
-			case 'D':
-			{
-				strlcpy(options.pgSetup.pgdata, optarg, MAXPGPATH);
-				log_trace("--pgdata %s", options.pgSetup.pgdata);
-				break;
-			}
-
-			case 'd':
-			{
-				dropAndDestroy = true;
-				log_trace("--destroy");
-				break;
-			}
-
-			case 'n':
-			{
-				strlcpy(options.hostname, optarg, _POSIX_HOST_NAME_MAX);
-				log_trace("--hostname %s", options.hostname);
-				break;
-			}
-
-			case 'p':
-			{
-				if (!stringToInt(optarg, &options.pgSetup.pgport))
-				{
-					log_fatal("--pgport argument is a valid port number: \"%s\"",
-							  optarg);
-					exit(EXIT_CODE_BAD_ARGS);
-				}
-				log_trace("--pgport %d", options.pgSetup.pgport);
-				break;
-			}
-
-			case 'V':
-			{
-				/* keeper_cli_print_version prints version and exits. */
-				keeper_cli_print_version(argc, argv);
-				break;
-			}
-
-			case 'v':
-			{
-				++verboseCount;
-				switch (verboseCount)
-				{
-					case 1:
-					{
-						log_set_level(LOG_INFO);
-						break;
-					}
-
-					case 2:
-					{
-						log_set_level(LOG_DEBUG);
-						break;
-					}
-
-					default:
-					{
-						log_set_level(LOG_TRACE);
-						break;
-					}
-				}
-				break;
-			}
-
-			case 'q':
-			{
-				log_set_level(LOG_ERROR);
-				break;
-			}
-
-			case 'h':
-			{
-				commandline_help(stderr);
-				exit(EXIT_CODE_QUIT);
-				break;
-			}
-
-			default:
-			{
-				/* getopt_long already wrote an error message */
-				commandline_help(stderr);
-				exit(EXIT_CODE_BAD_ARGS);
-				break;
-			}
-		}
-	}
-
-	if (dropAndDestroy &&
-		(!IS_EMPTY_STRING_BUFFER(options.hostname) ||
-		 options.pgSetup.pgport != 0))
-	{
-		log_error("Please use either --hostname and --pgport or ---destroy");
-		log_info("Destroying a node is not supported from a distance");
-		exit(EXIT_CODE_BAD_ARGS);
-	}
-
-	/* now that we have the command line parameters, prepare the options */
-	(void) prepare_keeper_options(&options);
-
-	/* publish our option parsing in the global variable */
-	keeperOptions = options;
-
-	return optind;
-}
-
-
-/*
- * cli_drop_node removes the local PostgreSQL node from the pg_auto_failover
- * monitor, and when it's a worker, from the Citus coordinator too.
- */
-static void
-cli_drop_node(int argc, char **argv)
-{
-	KeeperConfig config = keeperOptions;
-
-	bool missingPgdataIsOk = true;
-	bool pgIsNotRunningIsOk = true;
-	bool monitorDisabledIsOk = true;
-
-	/*
-	 * The configuration file is the last bit we remove, so we don't have to
-	 * implement "continue from previous failed attempt" when the configuration
-	 * file does not exists.
-	 */
-	if (!file_exists(config.pathnames.config))
-	{
-		log_error("Failed to find expected configuration file \"%s\"",
-				  config.pathnames.config);
-		exit(EXIT_CODE_BAD_CONFIG);
-	}
-
-	/*
-	 * We are going to need to use the right pg_ctl binary to control the
-	 * Postgres cluster: pg_ctl stop.
-	 */
-	switch (ProbeConfigurationFileRole(config.pathnames.config))
-	{
-		case PG_AUTOCTL_ROLE_MONITOR:
-		{
-			/*
-			 * Now check --hostname and --pgport and remove the entry on the
-			 * monitor.
-			 */
-			if (IS_EMPTY_STRING_BUFFER(config.hostname) ||
-				config.pgSetup.pgport == 0)
-			{
-				log_fatal("To remove a node from the monitor, both the "
-						  "--hostname and --pgport options are required");
-				exit(EXIT_CODE_BAD_ARGS);
-			}
-
-			/* pg_autoctl drop node on the monitor drops another node */
-			(void) cli_drop_node_from_monitor(&config,
-											  config.hostname,
-											  config.pgSetup.pgport);
-			return;
-		}
-
-		case PG_AUTOCTL_ROLE_KEEPER:
-		{
-			if (!IS_EMPTY_STRING_BUFFER(config.hostname) ||
-				config.pgSetup.pgport != 0)
-			{
-				log_fatal("Only dropping the local node is supported");
-				log_info("To drop another node, please use this command "
-						 "from the monitor itself.");
-				exit(EXIT_CODE_BAD_ARGS);
-			}
-
-			/* just read the keeper file in given KeeperConfig */
-			if (!keeper_config_read_file(&config,
-										 missingPgdataIsOk,
-										 pgIsNotRunningIsOk,
-										 monitorDisabledIsOk))
-			{
-				exit(EXIT_CODE_BAD_CONFIG);
-			}
-
-			/* drop the node and maybe destroy its PGDATA entirely. */
-			(void) cli_drop_local_node(&config, dropAndDestroy);
-
-			return;
-		}
-
-		default:
-		{
-			log_fatal("Unrecognized configuration file \"%s\"",
-					  config.pathnames.config);
-			exit(EXIT_CODE_BAD_CONFIG);
-		}
-	}
-}
-
-
-/*
- * cli_drop_monitor removes the local monitor node.
- */
-static void
-cli_drop_monitor(int argc, char **argv)
-{
-	KeeperConfig config = keeperOptions;
-
-	bool missingPgdataIsOk = true;
-	bool pgIsNotRunningIsOk = true;
-
-	/*
-	 * The configuration file is the last bit we remove, so we don't have to
-	 * implement "continue from previous failed attempt" when the configuration
-	 * file does not exists.
-	 */
-	if (!file_exists(config.pathnames.config))
-	{
-		log_error("Failed to find expected configuration file \"%s\"",
-				  config.pathnames.config);
-		exit(EXIT_CODE_BAD_CONFIG);
-	}
-
-	/*
-	 * We are going to need to use the right pg_ctl binary to control the
-	 * Postgres cluster: pg_ctl stop.
-	 */
-	switch (ProbeConfigurationFileRole(config.pathnames.config))
-	{
-		case PG_AUTOCTL_ROLE_MONITOR:
-		{
-			MonitorConfig mconfig = { 0 };
-
-			if (!monitor_config_init_from_pgsetup(&mconfig,
-												  &(config.pgSetup),
-												  missingPgdataIsOk,
-												  pgIsNotRunningIsOk))
-			{
-				/* errors have already been logged */
-				exit(EXIT_CODE_BAD_CONFIG);
-			}
-
-			/* expose the pgSetup in the given KeeperConfig */
-			config.pgSetup = mconfig.pgSetup;
-
-			/* somehow at this point we've lost our pathnames */
-			if (!keeper_config_set_pathnames_from_pgdata(
-					&(config.pathnames),
-					config.pgSetup.pgdata))
-			{
-				/* errors have already been logged */
-				exit(EXIT_CODE_BAD_ARGS);
-			}
-
-			/* drop the node and maybe destroy its PGDATA entirely. */
-			(void) cli_drop_local_node(&config, dropAndDestroy);
-			return;
-		}
-
-		case PG_AUTOCTL_ROLE_KEEPER:
-		{
-			log_fatal("Local node is not a monitor");
-			exit(EXIT_CODE_BAD_CONFIG);
-
-			break;
-		}
-
-		default:
-		{
-			log_fatal("Unrecognized configuration file \"%s\"",
-					  config.pathnames.config);
-			exit(EXIT_CODE_BAD_CONFIG);
-		}
-	}
-}
-
-
-/*
- * cli_drop_node_from_monitor calls pgautofailover.remove_node() on the
- * monitor for the given --hostname and --pgport.
- */
-static void
-cli_drop_node_from_monitor(KeeperConfig *config, const char *hostname, int port)
-{
-	Monitor monitor = { 0 };
-	MonitorConfig mconfig = { 0 };
-	char connInfo[MAXCONNINFO] = { 0 };
-
-	bool missingPgdataIsOk = true;
-	bool pgIsNotRunningIsOk = true;
-
-	if (!monitor_config_init_from_pgsetup(&mconfig,
-										  &(config->pgSetup),
-										  missingPgdataIsOk,
-										  pgIsNotRunningIsOk))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_BAD_CONFIG);
-	}
-
-	/* expose the pgSetup in the given KeeperConfig */
-	config->pgSetup = mconfig.pgSetup;
-
-	/* prepare to connect to the monitor, locally */
-	pg_setup_get_local_connection_string(&(mconfig.pgSetup), connInfo);
-	monitor_init(&monitor, connInfo);
-
-	if (!monitor_remove(&monitor, (char *) hostname, port))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_MONITOR);
 	}
 }
 

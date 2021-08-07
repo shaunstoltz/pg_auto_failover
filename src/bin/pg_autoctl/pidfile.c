@@ -497,3 +497,61 @@ pidfile_as_json(JSON_Value *js, const char *pidfile, bool includeStatus)
 
 	free(fileContents);
 }
+
+
+bool
+is_process_stopped(const char *pidfile, bool *stopped, pid_t *pid)
+{
+	if (!file_exists(pidfile))
+	{
+		*stopped = true;
+		return true;
+	}
+
+	if (!read_pidfile(pidfile, pid))
+	{
+		log_error("Failed to read PID file \"%s\"", pidfile);
+		return false;
+	}
+
+	*stopped = false;
+	return true;
+}
+
+
+/*
+ * wait_for_process_to_stop waits until the PID found in the pidfile is not running
+ * anymore.
+ */
+bool
+wait_for_process_to_stop(const char *pidfile, int timeout, bool *stopped, pid_t *pid)
+{
+	if (!is_process_stopped(pidfile, stopped, pid))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	log_info("An instance of pg_autoctl is running with PID %d, "
+			 "waiting for it to stop.", *pid);
+
+	int timeout_counter = timeout;
+
+	while (timeout_counter > 0)
+	{
+		if (kill(*pid, 0) == -1 && errno == ESRCH)
+		{
+			log_info("The pg_autoctl instance with pid %d "
+					 "has now terminated.",
+					 *pid);
+			*stopped = true;
+			return true;
+		}
+
+		sleep(1);
+		--timeout_counter;
+	}
+
+	*stopped = false;
+	return true;
+}

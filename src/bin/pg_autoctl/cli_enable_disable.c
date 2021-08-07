@@ -520,7 +520,7 @@ cli_enable_maintenance(int argc, char **argv)
 
 	while (!pgsql_retry_policy_expired(&retryPolicy))
 	{
-		int nodeId = keeper.state.current_node_id;
+		int64_t nodeId = keeper.state.current_node_id;
 		bool mayRetry = false;
 
 		if (monitor_start_maintenance(&(keeper.monitor), nodeId, &mayRetry))
@@ -531,16 +531,16 @@ cli_enable_maintenance(int argc, char **argv)
 
 		if (!mayRetry)
 		{
-			log_fatal("Failed to enable maintenance of node %d "
-					  "on the monitor, see above for details",
+			log_fatal("Failed to enable maintenance of node %" PRId64
+					  " on the monitor, see above for details",
 					  nodeId);
 			exit(EXIT_CODE_MONITOR);
 		}
 
 		int sleepTimeMs = pgsql_compute_connection_retry_sleep_time(&retryPolicy);
 
-		log_warn("Failed to enable maintenance of node %d on the monitor, "
-				 "retrying in %d ms.",
+		log_warn("Failed to enable maintenance of node %" PRId64
+				 " on the monitor, retrying in %d ms.",
 				 nodeId, sleepTimeMs);
 
 		/* we have milliseconds, pg_usleep() wants microseconds */
@@ -624,7 +624,7 @@ cli_disable_maintenance(int argc, char **argv)
 
 	while (!pgsql_retry_policy_expired(&retryPolicy))
 	{
-		int nodeId = keeper.state.current_node_id;
+		int64_t nodeId = keeper.state.current_node_id;
 		bool mayRetry = false;
 
 		if (monitor_stop_maintenance(&(keeper.monitor), nodeId, &mayRetry))
@@ -635,16 +635,16 @@ cli_disable_maintenance(int argc, char **argv)
 
 		if (!mayRetry)
 		{
-			log_fatal("Failed to disable maintenance of node %d "
-					  "on the monitor, see above for details",
+			log_fatal("Failed to disable maintenance of node %" PRId64
+					  " on the monitor, see above for details",
 					  nodeId);
 			exit(EXIT_CODE_MONITOR);
 		}
 
 		int sleepTimeMs = pgsql_compute_connection_retry_sleep_time(&retryPolicy);
 
-		log_warn("Failed to disable maintenance of node %d on the monitor, "
-				 "retrying in %d ms.",
+		log_warn("Failed to disable maintenance of node %" PRId64
+				 " on the monitor, retrying in %d ms.",
 				 nodeId, sleepTimeMs);
 
 		/* we have milliseconds, pg_usleep() wants microseconds */
@@ -1144,6 +1144,7 @@ update_monitor_connection_string(KeeperConfig *config)
 		3, { "sslmode", "sslrootcert", "sslcrl" }, { 0 }
 	};
 
+	bool checkForCompleteURI = true;
 	char newPgURI[MAXCONNINFO] = { 0 };
 
 	/* initialize SSL Params values */
@@ -1156,7 +1157,8 @@ update_monitor_connection_string(KeeperConfig *config)
 
 	if (!parse_pguri_info_key_vals(config->monitor_pguri,
 								   &sslParams,
-								   &params))
+								   &params,
+								   checkForCompleteURI))
 	{
 		log_warn(
 			"The monitor SSL setup is ready and your current "
@@ -1180,9 +1182,20 @@ update_monitor_connection_string(KeeperConfig *config)
 		return false;
 	}
 
+	char scrubbedConnectionString[MAXCONNINFO] = { 0 };
+	if (parse_and_scrub_connection_string(newPgURI, scrubbedConnectionString))
+	{
+		log_info("Trying to connect to monitor using connection string \"%s\"",
+				 scrubbedConnectionString);
+	}
+	else
+	{
+		log_error(
+			"Trying to connect to monitor using unparseable connection string \"%s\"",
+			newPgURI);
+		return false;
+	}
 
-	log_info("Trying to connect to monitor using connection string \"%s\"",
-			 newPgURI);
 
 	/*
 	 * Try to connect using the new connection string and don't update it if it
@@ -1197,7 +1210,7 @@ update_monitor_connection_string(KeeperConfig *config)
 	/* we have a new monitor URI with our new SSL parameters */
 	strlcpy(config->monitor_pguri, newPgURI, MAXCONNINFO);
 
-	log_info("Updating the monitor URI to \"%s\"", config->monitor_pguri);
+	log_info("Updating the monitor URI to \"%s\"", scrubbedConnectionString);
 
 	return true;
 }
@@ -1695,15 +1708,22 @@ cli_disable_monitor(int argc, char **argv)
 		if (optForce)
 		{
 			/* --force, and we found the node */
-			log_info("Removing node %d \"%s\" (%s:%d) from monitor",
+			log_info("Removing node %" PRId64 " \"%s\" (%s:%d) from monitor",
 					 nodesArray.nodes[nodeIndex].nodeId,
 					 nodesArray.nodes[nodeIndex].name,
 					 nodesArray.nodes[nodeIndex].host,
 					 nodesArray.nodes[nodeIndex].port);
 
-			if (!monitor_remove(monitor,
-								nodesArray.nodes[nodeIndex].host,
-								nodesArray.nodes[nodeIndex].port))
+			int64_t nodeId = -1;
+			int groupId = -1;
+
+			if (!monitor_remove_by_hostname(
+					monitor,
+					nodesArray.nodes[nodeIndex].host,
+					nodesArray.nodes[nodeIndex].port,
+					optForce,
+					&nodeId,
+					&groupId))
 			{
 				/* errors have already been logged */
 				exit(EXIT_CODE_MONITOR);
@@ -1712,7 +1732,7 @@ cli_disable_monitor(int argc, char **argv)
 		else
 		{
 			/* node was found on the monitor, but --force not provided */
-			log_info("Found node %d \"%s\" (%s:%d) on the monitor",
+			log_info("Found node %" PRId64 " \"%s\" (%s:%d) on the monitor",
 					 nodesArray.nodes[nodeIndex].nodeId,
 					 nodesArray.nodes[nodeIndex].name,
 					 nodesArray.nodes[nodeIndex].host,
